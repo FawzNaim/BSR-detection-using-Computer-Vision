@@ -301,7 +301,7 @@ def run_resnet_inference(
         cbar.set_label("BSR probability")
 
         plt.savefig(
-        "/content/BSR-detection-using-Computer-Vision/vgg19_prediction.png",
+        "/content/BSR-detection-using-Computer-Vision/resnet50_prediction.png",
         dpi=150,
         bbox_inches="tight"
 
