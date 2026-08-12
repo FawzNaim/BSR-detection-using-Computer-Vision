@@ -1,141 +1,370 @@
+# single_image_inference_resnet_all_images_aligned_NO_SAVE.py
+# Python 3.8/3.9 compatible
+#
+# Inference is identical whether training used 80/20 split or ALL images.
+# This version:
+#   - DOES NOT save any outputs to disk
+#   - ONLY shows plots (matplotlib)
+#
+# Aligns with your training preprocessing:
+# - BGR->RGB, resize to 512, /255, CHW float32 (NO ImageNet normalization)
+# - masks: resize NEAREST, binarize >0
+# - model: DeepLabV3-ResNet50 or FCN-ResNet50
+# - 1-channel logits -> sigmoid -> prob map in [0,1]
+
 import os
 import time
+from typing import Optional, Dict, Any, Tuple
+
 import cv2
+import numpy as np
 import torch
 import torch.nn as nn
-import numpy as np
 import matplotlib.pyplot as plt
-from torchvision.models.segmentation import deeplabv3_resnet50, fcn_resnet50
 from sklearn.metrics import accuracy_score, precision_score, recall_score
 
-# ==========================================
-# MODEL BUILDER
-# ==========================================
-def load_resnet_model(model_name, ckpt_path, device, aux_loss=True):
-    # Initialize base model
-    if model_name == "deeplabv3_resnet50":
-        model = deeplabv3_resnet50(weights=None, aux_loss=aux_loss)
+import torchvision
+from torchvision.models.segmentation import deeplabv3_resnet50, fcn_resnet50
+
+
+# ------------------ Build ResNet segmentation (binary) ------------------
+def _rewire_for_binary_output(model, model_name: str):
+    """Modify classifier (and aux_classifier if present) to output 1-channel logits."""
+    if "deeplabv3" in model_name:
+        if hasattr(model, "classifier") and model.classifier is not None:
+            last = model.classifier[-1]
+            if isinstance(last, nn.Conv2d):
+                model.classifier[-1] = nn.Conv2d(last.in_channels, 1, kernel_size=1)
+
+        if hasattr(model, "aux_classifier") and model.aux_classifier is not None:
+            aux_last = model.aux_classifier[-1]
+            if isinstance(aux_last, nn.Conv2d):
+                model.aux_classifier[-1] = nn.Conv2d(aux_last.in_channels, 1, kernel_size=1)
+
+    elif "fcn" in model_name:
+        if hasattr(model, "classifier") and model.classifier is not None:
+            last_conv_idx = None
+            for i in reversed(range(len(model.classifier))):
+                if isinstance(model.classifier[i], nn.Conv2d):
+                    last_conv_idx = i
+                    break
+            if last_conv_idx is not None:
+                in_ch = model.classifier[last_conv_idx].in_channels
+                model.classifier[last_conv_idx] = nn.Conv2d(in_ch, 1, kernel_size=1)
+
+        if hasattr(model, "aux_classifier") and model.aux_classifier is not None:
+            last_conv_idx = None
+            for i in reversed(range(len(model.aux_classifier))):
+                if isinstance(model.aux_classifier[i], nn.Conv2d):
+                    last_conv_idx = i
+                    break
+            if last_conv_idx is not None:
+                in_ch = model.aux_classifier[last_conv_idx].in_channels
+                model.aux_classifier[last_conv_idx] = nn.Conv2d(in_ch, 1, kernel_size=1)
     else:
-        model = fcn_resnet50(weights=None, aux_loss=aux_loss)
+        raise ValueError(f"Unsupported model_name: {model_name}")
 
-    # Manual layer swap for binary output (1 channel)
-    # Direct index access is more 'human-written' for specific architectures
-    in_ch = model.classifier[4].in_channels
-    model.classifier[4] = nn.Conv2d(in_ch, 1, kernel_size=1)
-    
-    if aux_loss and hasattr(model, 'aux_classifier'):
-        aux_in = model.aux_classifier[4].in_channels
-        model.aux_classifier[4] = nn.Conv2d(aux_in, 1, kernel_size=1)
-
-    # Load weights
-    print(f"Loading weights from: {ckpt_path}")
-    state = torch.load(ckpt_path, map_location=device)
-    
-    # Handle DataParallel 'module.' prefix if it exists
-    if any(k.startswith('module.') for k in state.keys()):
-        state = {k.replace('module.', ''): v for k, v in state.items()}
-    
-    model.load_state_dict(state)
-    model.to(device)
-    model.eval()
     return model
 
-# ==========================================
-# PROCESSING HELPERS
-# ==========================================
-def preprocess(img_path, size=512):
-    bgr = cv2.imread(img_path)
-    if bgr is None: raise ValueError("Image path invalid")
-    
-    h0, w0 = bgr.shape[:2]
+
+def build_resnet_segmentation(
+    model_name: str = "deeplabv3_resnet50",
+    pretrained: bool = False,
+    aux_loss: bool = True
+):
+    """
+    model_name: 'deeplabv3_resnet50' or 'fcn_resnet50'
+    aux_loss: MUST match training (True if checkpoint includes aux_classifier weights)
+    pretrained: False is recommended for inference (checkpoint overwrites weights).
+    """
+    if model_name == "deeplabv3_resnet50":
+        try:
+            weights = torchvision.models.segmentation.DeepLabV3_ResNet50_Weights.DEFAULT if pretrained else None
+            model = deeplabv3_resnet50(weights=weights, aux_loss=aux_loss)
+        except TypeError:
+            model = deeplabv3_resnet50(pretrained=pretrained, aux_loss=aux_loss)
+
+    elif model_name == "fcn_resnet50":
+        try:
+            weights = torchvision.models.segmentation.FCN_ResNet50_Weights.DEFAULT if pretrained else None
+            model = fcn_resnet50(weights=weights, aux_loss=aux_loss)
+        except TypeError:
+            model = fcn_resnet50(pretrained=pretrained, aux_loss=aux_loss)
+
+    else:
+        raise ValueError("model_name must be 'deeplabv3_resnet50' or 'fcn_resnet50'.")
+
+    model = _rewire_for_binary_output(model, model_name)
+    return model
+
+
+def _ensure_logits(output):
+    """Handle torchvision segmentation outputs (dict with 'out') or plain tensors."""
+    if isinstance(output, dict):
+        return output.get("out", None)
+    return output
+
+
+# ------------------ Pre/Post helpers ------------------
+def pick_device(device_preference: Optional[str] = None):
+    if device_preference:
+        if device_preference == "cpu":
+            return torch.device("cpu")
+        if device_preference.startswith("cuda") and torch.cuda.is_available():
+            return torch.device(device_preference)
+    return torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+
+def load_image_rgb_tensor(image_path: str, size: int = 512):
+    """BGR->RGB, resize, CHW float32 /255, returns (rgb_orig, (h,w), tensor NCHW)."""
+    bgr = cv2.imread(image_path, cv2.IMREAD_COLOR)
+    if bgr is None:
+        raise FileNotFoundError(f"Failed to read image: {image_path}")
+
     rgb = cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)
-    
-    # Standard resize/normalize match to training
-    resized = cv2.resize(rgb, (size, size))
-    tensor = torch.from_numpy(resized.transpose(2, 0, 1)).float() / 255.0
-    return rgb, (h0, w0), tensor.unsqueeze(0)
+    h0, w0 = rgb.shape[:2]
 
-def get_overlay(img, mask, alpha=0.4, color=(255, 0, 0)):
-    """Simple color overlay on RGB image"""
-    overlay = img.copy().astype(float)
-    if mask is not None:
-        idx = mask.astype(bool)
-        overlay[idx] = alpha * np.array(color) + (1 - alpha) * overlay[idx]
-    return overlay.astype(np.uint8)
+    rgb_resized = cv2.resize(rgb, (size, size), interpolation=cv2.INTER_LINEAR)
+    x = rgb_resized.transpose(2, 0, 1).astype(np.float32) / 255.0
+    x = torch.from_numpy(x).unsqueeze(0)  # NCHW
+    return rgb, (h0, w0), x
 
-# ==========================================
-# MAIN INFERENCE FUNCTION
-# ==========================================
-@torch.no_grad()
-def run_prediction(image_path, mask_path=None, **cfg):
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    
-    # 1. Setup Model
-    model = load_resnet_model(
-        cfg.get('model_name', 'deeplabv3_resnet50'),
-        cfg['ckpt'],
-        device,
-        aux_loss=cfg.get('aux_loss', True)
-    )
 
-    # 2. Prep Image
-    rgb_orig, (h0, w0), input_batch = preprocess(image_path, cfg.get('size', 512))
-    input_batch = input_batch.to(device)
+def load_mask_binary(mask_path: Optional[str], out_hw: Tuple[int, int]):
+    if not mask_path:
+        return None
+    m = cv2.imread(mask_path, cv2.IMREAD_GRAYSCALE)
+    if m is None:
+        raise FileNotFoundError(f"Failed to read mask: {mask_path}")
+    h, w = out_hw
+    m = cv2.resize(m, (w, h), interpolation=cv2.INTER_NEAREST)
+    return (m > 0).astype(np.uint8)
 
-    # 3. Predict
+
+def overlay_colored(rgb_uint8: np.ndarray, mask_bin_uint8: Optional[np.ndarray],
+                    alpha: float = 0.35, color=(255, 0, 0)) -> np.ndarray:
+    """Overlay a single-color mask on RGB image. color=(R,G,B)."""
+    if mask_bin_uint8 is None:
+        return rgb_uint8.copy()
+    mask = mask_bin_uint8.astype(bool)
+    out = rgb_uint8.astype(np.float32).copy()
+
+    color_img = np.zeros_like(rgb_uint8, dtype=np.float32)
+    color_img[..., 0] = color[0]
+    color_img[..., 1] = color[1]
+    color_img[..., 2] = color[2]
+
+    out[mask] = alpha * color_img[mask] + (1 - alpha) * out[mask]
+    return out.astype(np.uint8)
+
+
+def compute_metrics(pred_bin: np.ndarray, gt_bin: np.ndarray):
+    p, g = pred_bin.flatten(), gt_bin.flatten()
+    if g.sum() == 0 and p.sum() == 0:
+        return dict(acc=1.0, prec=0.0, rec=0.0, iou=1.0)
+
+    acc = accuracy_score(g, p)
+    prec = precision_score(g, p, zero_division=0)
+    rec = recall_score(g, p, zero_division=0)
+    inter = np.logical_and(g == 1, p == 1).sum()
+    uni = np.logical_or(g == 1, p == 1).sum()
+    iou = (inter / uni) if uni > 0 else 0.0
+    return dict(acc=acc, prec=prec, rec=rec, iou=iou)
+
+
+def _strip_module_prefix(state_dict: Dict[str, torch.Tensor]) -> Dict[str, torch.Tensor]:
+    """Strip 'module.' prefix if checkpoint came from DataParallel."""
+    if not state_dict:
+        return state_dict
+    first_key = next(iter(state_dict.keys()))
+    if first_key.startswith("module."):
+        return {k.replace("module.", "", 1): v for k, v in state_dict.items()}
+    return state_dict
+
+
+# ------------------ Single-image inference ------------------
+@torch.inference_mode()
+def run_resnet_inference(
+    image_path: str,
+    mask_path: Optional[str] = None,
+    *,
+    ckpt_path: Optional[str] = None,
+    checkpoints_dir: Optional[str] = None,
+    epoch: Optional[int] = None,
+    model_name: str = "deeplabv3_resnet50",
+    aux_loss: bool = True,
+    image_size: int = 512,
+    threshold: float = 0.5,
+    overlay_alpha: float = 0.35,
+    device_preference: Optional[str] = None,
+    show_plots: bool = True,
+    use_2x2_layout: bool = True,
+    show_with_cv2: bool = False
+) -> Dict[str, Any]:
+    """
+    Provide ONE of:
+      - ckpt_path=".../bsr_resnet_best_epoch_076.pth" (or epoch file)
+      - checkpoints_dir=".../checkpoints_resnet_YYYYMMDD_HHMMSS", epoch=76
+        expects filename: bsr_resnet_epoch_###.pth
+    """
+    if ckpt_path is None:
+        if checkpoints_dir is None or epoch is None:
+            raise ValueError("Provide either ckpt_path OR (checkpoints_dir and epoch).")
+        ckpt_path = os.path.join(checkpoints_dir, f"bsr_resnet_epoch_{int(epoch):03d}.pth")
+
+    if not os.path.isfile(ckpt_path):
+        raise FileNotFoundError(f"Checkpoint not found: {ckpt_path}")
+
+    device = pick_device(device_preference)
+    print(f"Device: {device}")
+    print(f"Model: {model_name} | aux_loss={aux_loss}")
+    print(f"Checkpoint: {ckpt_path}")
+
+    model = build_resnet_segmentation(model_name=model_name, pretrained=False, aux_loss=aux_loss).to(device)
+
+    ckpt = torch.load(ckpt_path, map_location=device)
+    if isinstance(ckpt, dict) and "state_dict" in ckpt:
+        ckpt = ckpt["state_dict"]
+    ckpt = _strip_module_prefix(ckpt)
+
+    missing, unexpected = model.load_state_dict(ckpt, strict=False)
+    if missing:
+        print(f"[load_state_dict] missing keys: {missing}")
+    if unexpected:
+        print(f"[load_state_dict] unexpected keys: {unexpected}")
+
+    model.eval()
+
+    rgb, (h0, w0), x = load_image_rgb_tensor(image_path, size=image_size)
+    x = x.to(device, non_blocking=True)
+
+    if device.type == "cuda":
+        torch.cuda.synchronize()
     t0 = time.time()
-    output = model(input_batch)['out']
-    runtime = time.time() - t0
-    
-    # 4. Post-process
-    prob_map = torch.sigmoid(output).squeeze().cpu().numpy()
-    prob_full = cv2.resize(prob_map, (w0, h0))
-    pred_mask = (prob_full > cfg.get('thresh', 0.5)).astype(np.uint8)
+    out = model(x)
+    logits = _ensure_logits(out)
+    if logits is None:
+        raise RuntimeError("Model did not return logits or an 'out' tensor.")
+    if device.type == "cuda":
+        torch.cuda.synchronize()
+    dt = time.time() - t0
 
-    # 5. Metrics & Visualization
-    print(f"\nResults for: {os.path.basename(image_path)}")
-    print(f"Time: {runtime:.3f}s | BSR Area: {pred_mask.mean()*100:.2f}%")
+    prob_small = torch.sigmoid(logits)[0, 0].detach().cpu().numpy().astype(np.float32)
+    prob_full = cv2.resize(prob_small, (w0, h0), interpolation=cv2.INTER_LINEAR)
 
-    gt_mask = None
-    if mask_path:
-        gt_raw = cv2.imread(mask_path, 0)
-        gt_mask = (cv2.resize(gt_raw, (w0, h0), interpolation=cv2.INTER_NEAREST) > 0).astype(np.uint8)
-        
-        # Calculate stats
-        y_true, y_pred = gt_mask.flatten(), pred_mask.flatten()
-        iou = np.sum((y_true & y_pred)) / (np.sum((y_true | y_pred)) + 1e-7)
-        print(f"IoU: {iou:.4f} | Prec: {precision_score(y_true, y_pred, zero_division=0):.4f}")
+    pred_bin = (prob_full >= threshold).astype(np.uint8)
 
-    # Plotting logic
-    plt.figure(figsize=(16, 8))
-    
-    plt.subplot(1, 4, 1); plt.imshow(rgb_orig); plt.title("Input"); plt.axis('off')
-    
-    pred_viz = get_overlay(rgb_orig, pred_mask, color=(255, 0, 0))
-    plt.subplot(1, 4, 2); plt.imshow(pred_viz); plt.title("Prediction (Red)"); plt.axis('off')
-    
-    if gt_mask is not None:
-        gt_viz = get_overlay(rgb_orig, gt_mask, color=(0, 255, 0))
-        plt.subplot(1, 4, 3); plt.imshow(gt_viz); plt.title("Ground Truth (Green)"); plt.axis('off')
-    
-    plt.subplot(1, 4, 4); plt.imshow(prob_full, cmap='jet'); plt.title("Confidence Map"); plt.axis('off')
-    
-    plt.tight_layout()
-    plt.show()
+    gt_bin = load_mask_binary(mask_path, (h0, w0)) if mask_path else None
 
-# ==========================================
-# CONFIGURATION
-# ==========================================
-if __name__ == "__main__":
-    # Update these paths manually
-    CONFIG = {
-        "ckpt": r"", #Add path to the best .pth file generated after training the model
-        "image": r"", #Add path to the image
-        "mask": r"", #Add path to the labeled mask
-        "model_name": "deeplabv3_resnet50",
-        "thresh": 0.5,
-        "size": 512,
-        "aux_loss": True
+    gt_overlay = overlay_colored(rgb, gt_bin, alpha=overlay_alpha, color=(0, 200, 0)) if gt_bin is not None else None
+    pred_overlay = overlay_colored(rgb, pred_bin, alpha=overlay_alpha, color=(255, 0, 0))
+
+    area_pct = 100.0 * float(pred_bin.mean())
+    mean_prob_in_mask = float(prob_full[pred_bin.astype(bool)].mean()) if pred_bin.any() else 0.0
+    max_prob_in_mask = float(prob_full[pred_bin.astype(bool)].max()) if pred_bin.any() else 0.0
+    global_mean_prob = float(prob_full.mean())
+
+    print("\n—— Prediction summary ——")
+    print(f"Inference time: {dt:.3f}s")
+    print(f"Threshold: {threshold:.2f}")
+    print(f"BSR area (% of image): {area_pct:.2f}%")
+    print(f"Mean prob (inside pred mask): {mean_prob_in_mask:.3f}")
+    print(f"Max  prob (inside pred mask): {max_prob_in_mask:.3f}")
+    print(f"Global mean prob: {global_mean_prob:.3f}")
+
+    metrics = None
+    if gt_bin is not None:
+        metrics = compute_metrics(pred_bin, gt_bin)
+        print(f"🧪 Metrics  IoU: {metrics['iou']:.3f} | Prec: {metrics['prec']:.3f} | Rec: {metrics['rec']:.3f} | Acc: {metrics['acc']:.3f}")
+    else:
+        print("ℹ️ No ground-truth mask provided; metrics skipped.")
+
+    if show_plots:
+        if use_2x2_layout:
+            fig, axes = plt.subplots(2, 2, figsize=(14, 12), constrained_layout=True)
+            axes = axes.ravel()
+        else:
+            fig, axes = plt.subplots(1, 4, figsize=(18, 6))
+
+        axes[0].imshow(rgb); axes[0].set_title("Original"); axes[0].axis("off")
+
+        if gt_overlay is not None:
+            axes[1].imshow(gt_overlay); axes[1].set_title("GT Overlay (green)"); axes[1].axis("off")
+        else:
+            axes[1].imshow(rgb); axes[1].set_title("GT Overlay (none)"); axes[1].axis("off")
+
+        axes[2].imshow(pred_overlay); axes[2].set_title(f"Pred Overlay (red) t={threshold:.2f}"); axes[2].axis("off")
+
+        im = axes[3].imshow(prob_full, cmap="jet", vmin=0, vmax=1)
+        axes[3].set_title("Probability (0–1)"); axes[3].axis("off")
+        cbar = fig.colorbar(im, ax=axes[3], fraction=0.046, pad=0.04)
+        cbar.set_label("BSR probability")
+
+        plt.savefig(
+        "/content/BSR-detection-using-Computer-Vision/vgg19_prediction.png",
+        dpi=150,
+        bbox_inches="tight"
+
+        plt.show()
+
+    if show_with_cv2:
+        prob_u8 = np.clip(prob_full * 255.0, 0, 255).astype(np.uint8)
+        cv2.imshow("Original (BGR)", cv2.cvtColor(rgb, cv2.COLOR_RGB2BGR))
+        cv2.imshow("Probability (0-255)", prob_u8)
+        cv2.imshow("Binary Mask", (pred_bin * 255).astype(np.uint8))
+        cv2.imshow("Pred Overlay", cv2.cvtColor(pred_overlay, cv2.COLOR_RGB2BGR))
+        if gt_overlay is not None:
+            cv2.imshow("GT Overlay", cv2.cvtColor(gt_overlay, cv2.COLOR_RGB2BGR))
+        print("Press any key in an image window to close...")
+        cv2.waitKey(0)
+        cv2.destroyAllWindows()
+
+    return {
+        "rgb": rgb,
+        "prob_float": prob_full,
+        "pred_bin": pred_bin,
+        "overlay_pred_rgb": pred_overlay,
+        "overlay_gt_rgb": gt_overlay,
+        "summary": {
+            "threshold": threshold,
+            "area_percent": area_pct,
+            "mean_prob_inside_pred_mask": mean_prob_in_mask,
+            "max_prob_inside_pred_mask": max_prob_in_mask,
+            "global_mean_prob": global_mean_prob,
+            "metrics": metrics,
+            "inference_seconds": dt,
+            "ckpt_path": ckpt_path,
+            "model_name": model_name,
+            "aux_loss": aux_loss,
+        }
     }
 
-    run_prediction(CONFIG["image"], mask_path=CONFIG["mask"], **CONFIG)
+
+# ------------------ Example usage ------------------
+if __name__ == "__main__":
+    MODEL_PATH = r"/content/BSR-detection-using-Computer-Vision/models/bsr_resnet_best_epoch_076.pth"
+    IMAGE_PATH = r"/content/BSR-detection-using-Computer-Vision/Non_BSR_2_GOM.png"
+    GT_MASK    = r""
+
+    res = run_resnet_inference(
+        image_path=IMAGE_PATH,
+        mask_path=GT_MASK,
+        ckpt_path=MODEL_PATH,
+
+        model_name="deeplabv3_resnet50",  # must match training
+        aux_loss=True,                    # must match training
+
+        image_size=512,
+        threshold=0.5,
+        overlay_alpha=0.35,
+
+        device_preference=None,
+        show_plots=True,
+        use_2x2_layout=True,
+        show_with_cv2=False
+    )
+
+    print("Done. Shapes — rgb:", res["rgb"].shape,
+          "| prob:", res["prob_float"].shape,
+          "| mask:", res["pred_bin"].shape)
+    print("Summary:", res["summary"])
