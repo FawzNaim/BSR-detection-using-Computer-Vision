@@ -389,7 +389,7 @@ def run_vgg19_unet_inference(
 # MAIN (example)
 # ===========================
 if __name__ == "__main__":
-    IMAGE_PATH = r"/content/BSR-detection-using-Computer-Vision/Non_BSR_2_GOM.png"
+    IMAGE_PATH = r"/content/BSR-detection-using-Computer-Vision/images/GOM_AT_BSR44.png"
     GT_MASK    = r""
 
     # Point to a checkpoint from your ALL-IMAGES training run folder
