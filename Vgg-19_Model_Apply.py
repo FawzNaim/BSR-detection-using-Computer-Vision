@@ -401,7 +401,7 @@ def run_vgg19_unet_inference(
 #  MAIN (example)
 # ===========================
 if __name__ == "__main__":
-    IMAGE_PATH = r"/content/BSR-detection-using-Computer-Vision/Non_BSR_2_GOM.png"
+    IMAGE_PATH = r"/content/BSR-detection-using-Computer-Vision/Non_BSR_1_GOM.png"
     GT_MASK    = r""
 
     # Option A: point directly to the checkpoint you want to test
