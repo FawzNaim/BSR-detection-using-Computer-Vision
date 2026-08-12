@@ -169,4 +169,4 @@ if __name__ == "__main__":
     GT_URL   = r"/content/BSR-detection-using-Computer-Vision/Non_BSR_2_GOM.png" #Add path to the labeled mask
     MODEL  = r"/content/BSR-detection-using-Computer-Vision/blob/main/models/bsr_vgg19_best_epoch_042.pth"   #Add path to the best .pth file generated after training the model
 
-    #res = predict_bsr(IMG_URL, MODEL, mask_path=GT_URL)
+    res = predict_bsr(IMG_URL, MODEL, mask_path=GT_URL)
