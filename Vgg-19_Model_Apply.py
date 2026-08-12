@@ -383,11 +383,11 @@ def run_vgg19_unet_inference(
 # MAIN (example)
 # ===========================
 if __name__ == "__main__":
-    IMAGE_PATH = r"D:\BSR Prediction using CV\Training images\Not used for training\Bonaventure_BSR3.png"
+    IMAGE_PATH = r"/content/BSR-detection-using-Computer-Vision/Non_BSR_2_GOM.png"
     GT_MASK    = r""
 
     # Point to a checkpoint from your ALL-IMAGES training run folder
-    CKPT_PATH  = r"E:\BSR Prediction using CV\Codes\Oct 26 Vgg 19 50 epochs 8 batches 70 30 ratio\Training model with 121 images Feb 21\checkpoints_vgg19_20260221_180748\bsr_vgg19_best_epoch_043.pth"
+    CKPT_PATH  = r"/content/BSR-detection-using-Computer-Vision/models/bsr_vgg19_best_epoch_050.pth"
 
     res = run_vgg19_unet_inference(
         image_path=IMAGE_PATH,
