@@ -304,6 +304,7 @@ def run_resnet_inference(
         "/content/BSR-detection-using-Computer-Vision/resnet50_prediction.png",
         dpi=150,
         bbox_inches="tight"
+        )
 
         plt.show()
 
