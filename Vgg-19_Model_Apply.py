@@ -1,23 +1,17 @@
-# single_image_inference_vgg19_unet_all_images_aligned.py
+# single_image_inference_vgg19_unet_aligned.py
 # Python 3.8/3.9 compatible
 #
-# Aligned to your VGG19-UNet training that used ALL images (no split).
-# IMPORTANT: Inference itself does not depend on whether training used a split or not.
-# What matters is that the MODEL ARCH + PREPROCESSING match training.
-#
-# Training-aligned preprocessing (as in your dataset __getitem__):
-# - BGR->RGB
-# - resize to 512
-# - /255.0
-# - NO ImageNet mean/std normalization
-#
-# Output:
-# - 1-channel logits -> sigmoid -> prob map in [0,1]
-# - optional GT mask overlay + metrics
+# Aligned to your VGG19-UNet TRAINING script style:
+# - Input preprocessing: BGR->RGB, resize to 512, /255, CHW float32 (NO ImageNet normalization)
+# - Mask preprocessing: resize NEAREST, binarize >0
+# - Output: 1-channel logits -> sigmoid -> prob map in [0,1]
+# - Supports:
+#     (A) ckpt_path directly, OR
+#     (B) checkpoints_dir + epoch -> bsr_vgg19_epoch_###.pth (you can change the pattern)
 #
 # Notes:
-# - If checkpoint was saved from DataParallel, strips "module." prefixes automatically.
-# - Overlays: GT = green, Pred = red
+# - If checkpoint was saved from DataParallel, we strip "module." prefixes automatically.
+# - In overlays: GT = green, Pred = red (titles match colors).
 
 import os
 import time
@@ -36,7 +30,7 @@ from torchvision import models
 
 # ===========================
 #  VGG19-UNet (AUTO-SKIP)
-#  Matches your training model that inferred skip channels from dummy pass
+#  (Matches your training model that inferred skip channels from dummy pass)
 # ===========================
 class ConvBlock(nn.Module):
     def __init__(self, in_ch, out_ch):
@@ -57,9 +51,10 @@ class ConvBlock(nn.Module):
 class VGG19UNet(nn.Module):
     """
     Robust VGG19-BN encoder (pool-based skips) + UNet decoder.
-    Decoder channel sizes inferred automatically from a dummy forward pass.
+    Decoder channel sizes inferred automatically from a dummy forward pass
+    so your checkpoints load cleanly and you avoid skip mismatches.
     """
-    def __init__(self, input_size=512, pretrained=False, freeze_encoder=False):
+    def __init__(self, input_size=512, pretrained=True, freeze_encoder=False):
         super().__init__()
         weights = models.VGG19_BN_Weights.DEFAULT if pretrained else None
         vgg = models.vgg19_bn(weights=weights)
@@ -73,22 +68,24 @@ class VGG19UNet(nn.Module):
         with torch.no_grad():
             dummy = torch.zeros(1, 3, input_size, input_size)
             skips, bottom = self._encode(dummy)
+
             if len(skips) < 5:
                 raise RuntimeError(f"Unexpected VGG structure: got {len(skips)} pool skips, expected 5.")
             s1, s2, s3, s4, s5 = skips[-5], skips[-4], skips[-3], skips[-2], skips[-1]
             c2, c3, c4, c5 = s2.shape[1], s3.shape[1], s4.shape[1], s5.shape[1]
             cb = bottom.shape[1]
 
-        self.up4  = nn.ConvTranspose2d(cb, c5, 2, stride=2)
+        # Decoder (channels tied to inferred skips)
+        self.up4 = nn.ConvTranspose2d(cb, c5, 2, stride=2)
         self.dec4 = ConvBlock(c5 + c5, c5)
 
-        self.up3  = nn.ConvTranspose2d(c5, c4, 2, stride=2)
+        self.up3 = nn.ConvTranspose2d(c5, c4, 2, stride=2)
         self.dec3 = ConvBlock(c4 + c4, c4)
 
-        self.up2  = nn.ConvTranspose2d(c4, c3, 2, stride=2)
+        self.up2 = nn.ConvTranspose2d(c4, c3, 2, stride=2)
         self.dec2 = ConvBlock(c3 + c3, c3)
 
-        self.up1  = nn.ConvTranspose2d(c3, c2, 2, stride=2)
+        self.up1 = nn.ConvTranspose2d(c3, c2, 2, stride=2)
         self.dec1 = ConvBlock(c2 + c2, c2)
 
         self.out = nn.Conv2d(c2, 1, kernel_size=1)
@@ -132,7 +129,7 @@ class VGG19UNet(nn.Module):
 
 
 # ===========================
-# Helpers (training-aligned)
+# Helpers (match training)
 # ===========================
 def pick_device(device_preference: Optional[str] = None):
     if device_preference:
@@ -167,7 +164,7 @@ def load_image_rgb_tensor(image_path: str, size: int = 512):
     h0, w0 = rgb.shape[:2]
 
     rgb_resized = cv2.resize(rgb, (size, size), interpolation=cv2.INTER_LINEAR)
-    x = rgb_resized.transpose(2, 0, 1).astype(np.float32) / 255.0
+    x = rgb_resized.transpose(2, 0, 1).astype(np.float32) / 255.0  # CHW
     x = torch.from_numpy(x).unsqueeze(0)  # NCHW
     return rgb, (h0, w0), x
 
@@ -183,11 +180,10 @@ def load_mask_binary(mask_path: Optional[str], out_hw: Tuple[int, int]) -> Optio
     return (m > 0).astype(np.uint8)
 
 
-def overlay_colored(rgb_uint8: np.ndarray, mask_bin_uint8: Optional[np.ndarray],
+def overlay_colored(rgb_uint8: np.ndarray, mask_bin_uint8: np.ndarray,
                     alpha: float = 0.35, color=(255, 0, 0)) -> np.ndarray:
     if mask_bin_uint8 is None:
         return rgb_uint8.copy()
-
     mask = mask_bin_uint8.astype(bool)
     out = rgb_uint8.astype(np.float32).copy()
 
@@ -215,7 +211,7 @@ def compute_metrics(pred_bin: np.ndarray, gt_bin: np.ndarray):
 
 
 # ===========================
-# Predict & Show (single image)
+#  Predict & Show
 # ===========================
 @torch.inference_mode()
 def run_vgg19_unet_inference(
@@ -235,16 +231,18 @@ def run_vgg19_unet_inference(
     save_probs: bool = True,
     show_plots: bool = True,
     use_2x2_layout: bool = True,
-):
+    show_with_cv2: bool = False,
+) -> Dict[str, Any]:
     """
     Provide ONE of:
-      - ckpt_path=".../bsr_vgg19_epoch_###.pth" or ".../bsr_vgg19_best_epoch_###.pth"
-      - checkpoints_dir=".../checkpoints_vgg19_YYYYMMDD_HHMMSS", epoch=##
-        expects filename: bsr_vgg19_epoch_###.pth
+      - ckpt_path=".../bsr_vgg19_epoch_043.pth" (or best_epoch file)
+      - checkpoints_dir=".../checkpoints_vgg19_YYYYMMDD_HHMMSS", epoch=43
+        expects filename: bsr_vgg19_epoch_###.pth (edit pattern below if needed)
     """
     if ckpt_path is None:
         if checkpoints_dir is None or epoch is None:
             raise ValueError("Provide either ckpt_path OR (checkpoints_dir and epoch).")
+        # ---- adjust this pattern to match what your training script wrote ----
         ckpt_path = os.path.join(checkpoints_dir, f"bsr_vgg19_epoch_{int(epoch):03d}.pth")
 
     if not os.path.isfile(ckpt_path):
@@ -254,11 +252,8 @@ def run_vgg19_unet_inference(
     print(f"Device: {device}")
     print(f"Checkpoint: {ckpt_path}")
 
-    # IMPORTANT:
-    # - For all-images training, just load your checkpoint.
-    # - pretrained=False avoids downloading ImageNet weights; checkpoint overwrites everything anyway.
+    # --- build model exactly like training (pretrained=False)
     model = VGG19UNet(input_size=input_size, pretrained=True, freeze_encoder=False).to(device)
-
     ckpt = torch.load(ckpt_path, map_location=device)
     if isinstance(ckpt, dict) and "state_dict" in ckpt:
         ckpt = ckpt["state_dict"]
@@ -276,7 +271,7 @@ def run_vgg19_unet_inference(
     rgb, (h0, w0), x = load_image_rgb_tensor(image_path, size=input_size)
     x = x.to(device, non_blocking=True)
 
-    # --- inference timing
+    # --- forward timing
     if device.type == "cuda":
         torch.cuda.synchronize()
     t0 = time.time()
@@ -285,7 +280,7 @@ def run_vgg19_unet_inference(
         torch.cuda.synchronize()
     dt = time.time() - t0
 
-    prob_small = torch.sigmoid(logits)[0, 0].detach().cpu().numpy().astype(np.float32)
+    prob_small = torch.sigmoid(logits)[0, 0].detach().cpu().numpy().astype(np.float32)  # [input_size,input_size]
 
     # Resize prob back to original
     prob_full = cv2.resize(prob_small, (w0, h0), interpolation=cv2.INTER_LINEAR)
@@ -298,7 +293,7 @@ def run_vgg19_unet_inference(
     gt_overlay = overlay_colored(rgb, gt_bin, alpha=overlay_alpha, color=(0, 200, 0)) if gt_bin is not None else None
     pred_overlay = overlay_colored(rgb, pred_bin, alpha=overlay_alpha, color=(255, 0, 0))
 
-    # --- summary stats
+    # --- stats
     area_pct = 100.0 * float(pred_bin.mean())
     mean_prob_in_mask = float(prob_full[pred_bin.astype(bool)].mean()) if pred_bin.any() else 0.0
     max_prob_in_mask = float(prob_full[pred_bin.astype(bool)].max()) if pred_bin.any() else 0.0
@@ -319,7 +314,7 @@ def run_vgg19_unet_inference(
     else:
         print("ℹ️ No ground-truth mask provided; metrics skipped.")
 
-    # --- save outputs
+    # --- save artifacts (optional)
     if save_dir:
         os.makedirs(save_dir, exist_ok=True)
         base = save_basename if save_basename else os.path.splitext(os.path.basename(image_path))[0]
@@ -337,7 +332,7 @@ def run_vgg19_unet_inference(
                 cv2.imwrite(os.path.join(save_dir, f"{base}_overlay_gt.png"),
                             cv2.cvtColor(gt_overlay, cv2.COLOR_RGB2BGR))
 
-    # --- plot panels
+    # --- Plot: Original | GT | Pred | Prob
     if show_plots:
         if use_2x2_layout:
             fig, axes = plt.subplots(2, 2, figsize=(14, 12), constrained_layout=True)
@@ -345,7 +340,11 @@ def run_vgg19_unet_inference(
         else:
             fig, axes = plt.subplots(1, 4, figsize=(18, 6))
 
+        for ax in axes:
+            ax.set_aspect("equal")
+
         axes[0].imshow(rgb); axes[0].set_title("Original"); axes[0].axis("off")
+
         if gt_overlay is not None:
             axes[1].imshow(gt_overlay); axes[1].set_title("GT Overlay (green)"); axes[1].axis("off")
         else:
@@ -358,20 +357,27 @@ def run_vgg19_unet_inference(
         cbar = fig.colorbar(im, ax=axes[3], fraction=0.046, pad=0.04)
         cbar.set_label("BSR probability")
 
-        plt.savefig(
-        "/content/BSR-detection-using-Computer-Vision/vgg19_prediction.png",
-        dpi=150,
-        bbox_inches="tight"
-        )
-        
         plt.show()
 
+    # --- Optional OpenCV windows
+    if show_with_cv2:
+        prob_u8 = np.clip(prob_full * 255.0, 0, 255).astype(np.uint8)
+        cv2.imshow("Original (BGR)", cv2.cvtColor(rgb, cv2.COLOR_RGB2BGR))
+        cv2.imshow("Probability (0-255)", prob_u8)
+        cv2.imshow("Binary Mask", (pred_bin * 255).astype(np.uint8))
+        cv2.imshow("Pred Overlay", cv2.cvtColor(pred_overlay, cv2.COLOR_RGB2BGR))
+        if gt_overlay is not None:
+            cv2.imshow("GT Overlay", cv2.cvtColor(gt_overlay, cv2.COLOR_RGB2BGR))
+        print("Press any key in an image window to close...")
+        cv2.waitKey(0)
+        cv2.destroyAllWindows()
+
     return {
-        "rgb": rgb,
-        "prob": prob_full,
-        "pred_bin": pred_bin,
-        "overlay_pred_rgb": pred_overlay,
-        "overlay_gt_rgb": gt_overlay,
+        "rgb": rgb,                       # HxWx3 uint8
+        "prob": prob_full,                # HxW float32 [0..1]
+        "pred_bin": pred_bin,             # HxW uint8 {0,1}
+        "overlay_pred_rgb": pred_overlay, # HxWx3 uint8
+        "overlay_gt_rgb": gt_overlay,     # HxWx3 uint8 or None
         "summary": {
             "threshold": threshold,
             "area_percent": area_pct,
@@ -386,30 +392,44 @@ def run_vgg19_unet_inference(
 
 
 # ===========================
-# MAIN (example)
+#  MAIN (example)
 # ===========================
 if __name__ == "__main__":
-    IMAGE_PATH = r"/content/BSR-detection-using-Computer-Vision/images/GOM_AT_BSR44.png"
+    IMAGE_PATH = r"/content/BSR-detection-using-Computer-Vision/Non_BSR_2_GOM.png"
     GT_MASK    = r""
 
-    # Point to a checkpoint from your ALL-IMAGES training run folder
-    CKPT_PATH  = r"/content/BSR-detection-using-Computer-Vision/models/bsr_vgg19_best_epoch_050.pth"
+    # Option A: point directly to the checkpoint you want to test
+    CKPT_PATH  = r"/content/BSR-detection-using-Computer-Vision/models/bsr_vgg19_best_epoch_042.pth"
+
+    # Option B: if you saved per-epoch checkpoints into a folder
+    # CKPT_DIR = r"E:\...\checkpoints_vgg19_20260216_093343"
+    # EPOCH = 43
 
     res = run_vgg19_unet_inference(
         image_path=IMAGE_PATH,
         mask_path=GT_MASK,
-        ckpt_path=CKPT_PATH,
+        ckpt_path=CKPT_PATH,          # or use checkpoints_dir + epoch
+        # checkpoints_dir=CKPT_DIR,
+        # epoch=EPOCH,
 
         input_size=512,
         threshold=0.5,
         overlay_alpha=0.35,
+        device_preference=None,       # auto CUDA if available
 
-        save_dir=None,
+        save_dir=None,                # set a folder path to save prob/mask/overlays
+        save_basename=None,
+        save_overlay=True,
+        save_probs=True,
+
         show_plots=True,
         use_2x2_layout=True,
+        show_with_cv2=False
     )
 
     print("Done. Shapes — rgb:", res["rgb"].shape,
           "| prob:", res["prob"].shape,
-          "| mask:", res["pred_bin"].shape)
+          "| mask:", res["pred_bin"].shape,
+          "| overlay_pred:", None if res["overlay_pred_rgb"] is None else res["overlay_pred_rgb"].shape,
+          "| overlay_gt:", None if res["overlay_gt_rgb"] is None else res["overlay_gt_rgb"].shape)
     print("Summary:", res["summary"])
