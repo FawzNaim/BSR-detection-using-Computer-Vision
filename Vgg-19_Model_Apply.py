@@ -167,6 +167,6 @@ if __name__ == "__main__":
     # Settings
     IMG_URL  = r"/content/BSR-detection-using-Computer-Vision/Non_BSR_2_GOM.png" #Add path to the image
     GT_URL   = r"" #Add path to the labeled mask
-    MODEL  = r""   #Add path to the best .pth file generated after training the model
+    MODEL  = r"/content/BSR-detection-using-Computer-Vision/blob/main/models/bsr_vgg19_best_epoch_042.pth"   #Add path to the best .pth file generated after training the model
 
     res = predict_bsr(IMG_URL, WEIGHTS, mask_path=GT_URL)
