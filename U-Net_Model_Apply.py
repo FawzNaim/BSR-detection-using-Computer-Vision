@@ -347,7 +347,7 @@ def run_unet_inference(
 # =========================================================
 if __name__ == "__main__":
     run_unet_inference(
-        image_path=r"/content/BSR-detection-using-Computer-Vision/Non_BSR_1_GOM.png",
+        image_path=r"/content/BSR-detection-using-Computer-Vision/Non_BSR_2_GOM.png",
         mask_path=r"",
 
         # Option A: direct checkpoint
