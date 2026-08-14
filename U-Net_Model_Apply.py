@@ -5,7 +5,7 @@ import numpy as np
 import torch
 import torch.nn as nn
 import matplotlib.pyplot as plt
-from sklearn.metrics import accuracy_score, precision_score, recall_score
+from sklearn.metrics import accuracy_score, precision_score, recall_score, f1_score
 
 
 # =========================================================
@@ -208,22 +208,102 @@ def overlay_colored(img_rgb, mask_bin, color=(0, 200, 0), alpha=0.35):
 
 
 def compute_metrics(pred_bin, gt_bin):
+    """Strict pixel-wise segmentation metrics."""
     p = pred_bin.flatten()
     g = gt_bin.flatten()
-
-    if g.sum() == 0:
-        acc = accuracy_score(g, p)
-        if p.sum() == 0:
-            return dict(acc=acc, prec=0.0, rec=0.0, iou=1.0)
-        return dict(acc=acc, prec=0.0, rec=0.0, iou=0.0)
 
     acc = accuracy_score(g, p)
     prec = precision_score(g, p, zero_division=0)
     rec = recall_score(g, p, zero_division=0)
+    f1 = f1_score(g, p, zero_division=0)
+
     inter = np.logical_and(g == 1, p == 1).sum()
     union = np.logical_or(g == 1, p == 1).sum()
-    iou = inter / union if union > 0 else 0.0
-    return dict(acc=acc, prec=prec, rec=rec, iou=iou)
+
+    # If both masks are empty, define IoU as 1.0.
+    iou = inter / union if union > 0 else 1.0
+
+    return dict(acc=acc, prec=prec, rec=rec, f1=f1, iou=iou)
+
+
+def compute_tolerance_metrics(pred_bin, gt_bin, tolerance_px=2):
+    """
+    Distance-tolerant Precision / Recall / F1 for thin BSR masks.
+
+    A predicted BSR pixel is counted as correct if it lies within
+    `tolerance_px` Euclidean pixels of any ground-truth BSR pixel.
+
+    Likewise, a ground-truth BSR pixel is counted as recovered if it lies
+    within `tolerance_px` pixels of any predicted BSR pixel.
+
+    This is an evaluation metric only; it does NOT change the prediction
+    mask and does NOT require retraining.
+    """
+    pred = pred_bin.astype(bool)
+    gt = gt_bin.astype(bool)
+
+    n_pred = int(pred.sum())
+    n_gt = int(gt.sum())
+
+    # Handle empty-mask cases explicitly.
+    if n_gt == 0 and n_pred == 0:
+        return dict(
+            tolerance_px=tolerance_px,
+            prec_tol=1.0,
+            rec_tol=1.0,
+            f1_tol=1.0
+        )
+
+    if n_gt == 0:
+        return dict(
+            tolerance_px=tolerance_px,
+            prec_tol=0.0,
+            rec_tol=0.0,
+            f1_tol=0.0
+        )
+
+    if n_pred == 0:
+        return dict(
+            tolerance_px=tolerance_px,
+            prec_tol=0.0,
+            rec_tol=0.0,
+            f1_tol=0.0
+        )
+
+    # OpenCV distanceTransform returns the Euclidean distance from each
+    # non-zero pixel to the nearest zero pixel.
+    #
+    # By setting the target BSR pixels to zero, we obtain the distance of
+    # every image pixel to the nearest BSR pixel.
+    dist_to_gt = cv2.distanceTransform(
+        (~gt).astype(np.uint8),
+        cv2.DIST_L2,
+        cv2.DIST_MASK_PRECISE
+    )
+
+    dist_to_pred = cv2.distanceTransform(
+        (~pred).astype(np.uint8),
+        cv2.DIST_L2,
+        cv2.DIST_MASK_PRECISE
+    )
+
+    matched_pred = pred & (dist_to_gt <= tolerance_px)
+    matched_gt = gt & (dist_to_pred <= tolerance_px)
+
+    prec_tol = matched_pred.sum() / n_pred
+    rec_tol = matched_gt.sum() / n_gt
+
+    if (prec_tol + rec_tol) > 0:
+        f1_tol = 2.0 * prec_tol * rec_tol / (prec_tol + rec_tol)
+    else:
+        f1_tol = 0.0
+
+    return dict(
+        tolerance_px=tolerance_px,
+        prec_tol=float(prec_tol),
+        rec_tol=float(rec_tol),
+        f1_tol=float(f1_tol)
+    )
 
 
 # =========================================================
@@ -240,6 +320,7 @@ def run_unet_inference(
     prefer_best=True,
     size=512,
     thresh=0.5,
+    distance_tolerances=(2, 3, 4, 5),
     device_preference="cuda",
     p_drop=0.0,
     debug_shapes=False,
@@ -299,9 +380,34 @@ def run_unet_inference(
 
     if gt_bin is not None:
         m = compute_metrics(pred_bin, gt_bin)
-        print(f"🧪 Metrics  IoU: {m['iou']:.3f} | Prec: {m['prec']:.3f} | Rec: {m['rec']:.3f} | Acc: {m['acc']:.3f}")
+
+        print(
+            f"🧪 Strict metrics  "
+            f"IoU: {m['iou']:.3f} | "
+            f"F1: {m['f1']:.3f} | "
+            f"Prec: {m['prec']:.3f} | "
+            f"Rec: {m['rec']:.3f} | "
+            f"Acc: {m['acc']:.3f}"
+        )
+
+        tolerance_results = {}
+        for tol in distance_tolerances:
+            tm = compute_tolerance_metrics(
+                pred_bin,
+                gt_bin,
+                tolerance_px=tol
+            )
+            tolerance_results[tol] = tm
+
+            print(
+                f"📏 Distance tolerance ±{tol}px  "
+                f"F1: {tm['f1_tol']:.3f} | "
+                f"Prec: {tm['prec_tol']:.3f} | "
+                f"Rec: {tm['rec_tol']:.3f}"
+            )
     else:
         m = None
+        tolerance_results = None
         print("ℹ️ No ground-truth mask provided; metrics skipped.")
 
     ncols = 4 if show_probability else 3
@@ -337,6 +443,7 @@ def run_unet_inference(
         "pred_bin": pred_bin,
         "gt_bin": gt_bin,
         "metrics": m,
+        "tolerance_metrics": tolerance_results,
         "inference_seconds": dt,
         "ckpt_path": ckpt_path,
     }
@@ -347,8 +454,8 @@ def run_unet_inference(
 # =========================================================
 if __name__ == "__main__":
     run_unet_inference(
-        image_path=r"/content/BSR-detection-using-Computer-Vision/Non_BSR_2_GOM.png",
-        mask_path=r"",
+        image_path=r"/content/BSR-detection-using-Computer-Vision/Bonaventure_BSR4.png",
+        mask_path=r"/content/BSR-detection-using-Computer-Vision/Bonaventure_BSR4_label.png",
 
         # Option A: direct checkpoint
         ckpt_path=r"/content/BSR-detection-using-Computer-Vision/models/bsr_unet_best_epoch_099.pth",
@@ -360,6 +467,7 @@ if __name__ == "__main__":
         prefer_best=True,
         size=512,
         thresh=0.5,
+        distance_tolerances=(2, 3, 4, 5),
         device_preference="cuda",
         p_drop=0.0,
         debug_shapes=False,
