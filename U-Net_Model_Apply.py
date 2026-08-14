@@ -454,8 +454,8 @@ def run_unet_inference(
 # =========================================================
 if __name__ == "__main__":
     run_unet_inference(
-        image_path=r"/content/BSR-detection-using-Computer-Vision/Bonaventure_BSR4.png",
-        mask_path=r"/content/BSR-detection-using-Computer-Vision/Bonaventure_BSR4_label.png",
+        image_path=r"/content/BSR-detection-using-Computer-Vision/Bonaventure_BSR.png",
+        mask_path=r"/content/BSR-detection-using-Computer-Vision/Bonaventure_BSR_label.png",
 
         # Option A: direct checkpoint
         ckpt_path=r"/content/BSR-detection-using-Computer-Vision/models/bsr_unet_best_epoch_099.pth",
