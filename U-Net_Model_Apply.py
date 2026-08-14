@@ -365,9 +365,9 @@ def run_unet_inference(
 if __name__ == "__main__":
     # Option A: give the checkpoint path directly
     run_unet_inference(
-        image_path=r"D:/BSR Prediction using CV/Training images/Not used for training/Bonaventure_BSR5.png",
-        mask_path=r"D:\BSR Prediction using CV\Training images\Not used for training\Bonaventure_BSR5_label.png",
-        ckpt_path=r"E:\BSR Prediction using CV\Codes\Aug 22 U-Net 8 batches 100 epochs 70 30 ratio\Feb 07 80 20 split\checkpoints_unet_20260216_093343\bsr_unet_epoch_100.pth",
+        image_path=r"/content/BSR-detection-using-Computer-Vision/Bonaventure_BSR4.png",
+        mask_path=r"/content/BSR-detection-using-Computer-Vision/Bonaventure_BSR4_label.png",
+        ckpt_path=r"/content/BSR-detection-using-Computer-Vision/bsr_unet_best_epoch_074.pth",
         size=512,
         thresh=0.5,
         distance_tolerances=(2, 3, 4, 5),
