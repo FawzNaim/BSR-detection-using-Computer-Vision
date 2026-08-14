@@ -499,7 +499,7 @@ if __name__ == "__main__":
     GT_MASK    = r"D:\BSR Prediction using CV\Training images\Not used for training\GOM_MC_BSR123_label.png"
 
     # Option A: point directly to the checkpoint you want to test
-    CKPT_PATH  = r"E:\BSR Prediction using CV\Codes\Oct 26 Vgg 19 50 epochs 8 batches 70 30 ratio\Feb 11 80 20 split\checkpoints_vgg19_20260214_063755\bsr_vgg19_best_epoch_042.pth"
+    CKPT_PATH  = r"/content/BSR-detection-using-Computer-Vision/models/bsr_vgg19_best_epoch_042.pth"
 
     # Option B: if you saved per-epoch checkpoints into a folder
     # CKPT_DIR = r"E:\...\checkpoints_vgg19_20260216_093343"
