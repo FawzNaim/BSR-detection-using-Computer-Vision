@@ -339,7 +339,7 @@ def run_unet_inference(
 
     plt.tight_layout()
 
-     plt.savefig(
+    plt.savefig(
     "/content/BSR-detection-using-Computer-Vision/unet_prediction.png",
     dpi=150,
     bbox_inches="tight"
