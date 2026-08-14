@@ -367,7 +367,7 @@ if __name__ == "__main__":
     run_unet_inference(
         image_path=r"/content/BSR-detection-using-Computer-Vision/Bonaventure_BSR4.png",
         mask_path=r"/content/BSR-detection-using-Computer-Vision/Bonaventure_BSR4_label.png",
-        ckpt_path=r"/content/BSR-detection-using-Computer-Vision/bsr_unet_best_epoch_074.pth",
+        ckpt_path=r"/content/BSR-detection-using-Computer-Vision/models/bsr_unet_best_epoch_074.pth",
         size=512,
         thresh=0.5,
         distance_tolerances=(2, 3, 4, 5),
