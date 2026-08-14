@@ -338,6 +338,13 @@ def run_unet_inference(
         cbar.set_label("BSR probability")
 
     plt.tight_layout()
+
+     plt.savefig(
+    "/content/BSR-detection-using-Computer-Vision/unet_prediction.png",
+    dpi=150,
+    bbox_inches="tight"
+    ) 
+
     plt.show()
 
     # Return useful outputs programmatically (optional)
