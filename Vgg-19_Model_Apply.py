@@ -501,8 +501,8 @@ def run_vgg19_unet_inference(
 #  MAIN (example)
 # ===========================
 if __name__ == "__main__":
-    IMAGE_PATH = r"/content/BSR-detection-using-Computer-Vision/Bonaventure_BSR4.png"
-    GT_MASK    = r"/content/BSR-detection-using-Computer-Vision/Bonaventure_BSR4_label.png"
+    IMAGE_PATH = r"/content/BSR-detection-using-Computer-Vision/Bonaventure_BSR5.png"
+    GT_MASK    = r"/content/BSR-detection-using-Computer-Vision/Bonaventure_BSR5_label.png"
 
     # Option A: point directly to the checkpoint you want to test
     CKPT_PATH  = r"/content/BSR-detection-using-Computer-Vision/models/bsr_vgg19_best_epoch_042.pth"
