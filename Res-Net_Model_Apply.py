@@ -441,6 +441,12 @@ def run_resnet_inference(
         cbar = fig.colorbar(im, ax=axes[3], fraction=0.046, pad=0.04)
         cbar.set_label("BSR probability")
 
+        plt.savefig(
+        "/content/BSR-detection-using-Computer-Vision/resnet_prediction.png",
+        dpi=150,
+        bbox_inches="tight"
+        )
+
         plt.show()
 
     # Optional OpenCV windows
