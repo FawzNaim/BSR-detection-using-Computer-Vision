@@ -488,9 +488,9 @@ def run_resnet_inference(
 if __name__ == "__main__":
     # Option A: checkpoint path directly (best or epoch)
     MODEL_PATH = r"/content/BSR-detection-using-Computer-Vision/models/bsr_resnet_best_epoch_094.pth"
-    IMAGE_PATH = r"D:\BSR Prediction using CV\Training images\Not used for training\GOM_MC_BSR123.png"
-    GT_MASK    = r"D:\BSR Prediction using CV\Training images\Not used for training\GOM_MC_BSR123_label.png"
-    OUT_DIR    = r"D:\BSR Prediction using CV\Training images\Not used for training\GOM_MC_BSR123"
+    IMAGE_PATH = r"/content/BSR-detection-using-Computer-Vision/Bonaventure_BSR4.png"
+    GT_MASK    = r"/content/BSR-detection-using-Computer-Vision/Bonaventure_BSR4_label.png"
+    #OUT_DIR    = r"D:\BSR Prediction using CV\Training images\Not used for training\GOM_MC_BSR123"
 
     res = run_resnet_inference(
         image_path=IMAGE_PATH,
