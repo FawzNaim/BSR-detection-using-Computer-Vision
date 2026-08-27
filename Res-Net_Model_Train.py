@@ -9,6 +9,7 @@ import matplotlib.pyplot as plt
 import torch.nn as nn
 from datetime import datetime
 from torch.utils.data import Dataset, DataLoader, WeightedRandomSampler
+from torchvision.models import ResNet50_Weights
 from torchvision.models.segmentation import deeplabv3_resnet50
 from torch.amp import autocast, GradScaler
 from sklearn.metrics import precision_score, recall_score, accuracy_score
@@ -23,8 +24,8 @@ PARAMS = {
     "lr": 3e-4,
     "wd": 1e-4,
     "pos_weight": 15.0,
-    "img_dir": r"", #Add path to the directory with the training images
-    "mask_dir": r"", #Add path to the directory with the training image masks
+    "img_dir": r"images", #Add path to the directory with the training images
+    "mask_dir": r"masks", #Add path to the directory with the training image masks
     "device": torch.device("cuda" if torch.cuda.is_available() else "cpu")
 }
 
@@ -72,16 +73,14 @@ class BSRDataset(Dataset):
 # ==========================================
 def get_deeplab():
     # Load model and swap heads for binary segmentation (1 channel)
-    model = deeplabv3_resnet50(weights='DEFAULT')
+    model = deeplabv3_resnet50(weights=None,
+                               weights_backbone=ResNet50_Weights.DEFAULT,
+                               aux_loss=False
+                              )
     
     # Update main classifier
     in_channels = model.classifier[4].in_channels
     model.classifier[4] = nn.Conv2d(in_channels, 1, kernel_size=1)
-    
-    # Update aux classifier
-    if hasattr(model, 'aux_classifier') and model.aux_classifier:
-        aux_in = model.aux_classifier[4].in_channels
-        model.aux_classifier[4] = nn.Conv2d(aux_in, 1, kernel_size=1)
         
     return model
 
