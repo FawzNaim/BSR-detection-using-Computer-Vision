@@ -415,8 +415,8 @@ def train_one_fold(dataset, fold_id, train_idx, val_idx, device,
 if __name__ == "__main__":
     set_seed(42)
 
-    img_dir = r"" #Add path to directory with training images
-    mask_dir = r"" #Add path to directory with training masks
+    img_dir = r"images" #Add path to directory with training images
+    mask_dir = r"masks" #Add path to directory with training masks
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"Using device: {device}")
