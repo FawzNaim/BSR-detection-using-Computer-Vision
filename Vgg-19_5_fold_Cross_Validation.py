@@ -9,7 +9,7 @@ import numpy as np
 import time
 import csv
 from datetime import datetime
-from sklearn.metrics import precision_score, recall_score, accuracy_score
+from sklearn.metrics import precision_score, recall_score, f1_score
 from sklearn.model_selection import KFold
 import random
 import pandas as pd
@@ -187,19 +187,15 @@ def calculate_metrics_from_logits(logits, target, thresh=0.5):
     pred_np = pred.detach().cpu().numpy().flatten()
     target_np = target.detach().cpu().numpy().flatten()
 
-    if np.sum(target_np) == 0:
-        accuracy = accuracy_score(target_np, pred_np)
-        return accuracy, 0.0, 0.0, 0.0
-
-    accuracy = accuracy_score(target_np, pred_np)
     precision = precision_score(target_np, pred_np, zero_division=0)
     recall = recall_score(target_np, pred_np, zero_division=0)
+    f1 = f1_score(target_np, pred_np, zero_division=0)
 
     intersection = np.logical_and(target_np, pred_np)
     union = np.logical_or(target_np, pred_np)
     iou = np.sum(intersection) / np.sum(union) if np.sum(union) > 0 else 0.0
 
-    return accuracy, precision, recall, iou
+    return f1, precision, recall, iou
 
 # ------------------ AMP (with fallback) ------------------
 try:
@@ -213,7 +209,7 @@ except Exception:
 def evaluate_epoch(model, loader, criterion_bce, device, thresh=0.5, use_amp=True):
     model.eval()
     total_loss = total_bce = total_dice = 0.0
-    total_accuracy = total_precision = total_recall = total_iou = 0.0
+    total_f1 = total_precision = total_recall = total_iou = 0.0
     num_batches = 0
 
     with torch.no_grad():
@@ -226,12 +222,12 @@ def evaluate_epoch(model, loader, criterion_bce, device, thresh=0.5, use_amp=Tru
                 dsc = dice_loss_from_logits(logits, mask)
                 loss = 0.5 * bce + 0.5 * dsc
 
-            acc, prec, rec, iou = calculate_metrics_from_logits(logits, mask, thresh=thresh)
+            f1, prec, rec, iou = calculate_metrics_from_logits(logits, mask, thresh=thresh)
 
             total_loss += loss.item()
             total_bce += bce.item()
             total_dice += dsc.item()
-            total_accuracy += acc
+            total_f1 += f1
             total_precision += prec
             total_recall += rec
             total_iou += iou
@@ -244,7 +240,7 @@ def evaluate_epoch(model, loader, criterion_bce, device, thresh=0.5, use_amp=Tru
         total_loss / num_batches,
         total_bce / num_batches,
         total_dice / num_batches,
-        total_accuracy / num_batches,
+        total_f1 / num_batches,
         total_precision / num_batches,
         total_recall / num_batches,
         total_iou / num_batches
@@ -267,7 +263,7 @@ def write_fold_membership_csv(dataset, fold_id, train_idx, val_idx, out_dir):
 
 # ------------------ Train one fold ------------------
 def train_one_fold(dataset, fold_id, train_idx, val_idx, device,
-                   num_epochs=50, lr=3e-4, weight_decay=1e-4, batch_size=8,
+                   num_epochs=100, lr=3e-4, weight_decay=1e-4, batch_size=8,
                    pos_multiplier=5.0, use_amp=True, eval_thresh=0.5,
                    out_dir="cv_outputs"):
 
@@ -330,8 +326,8 @@ def train_one_fold(dataset, fold_id, train_idx, val_idx, device,
     log_csv = os.path.join(out_dir, f"fold_{fold_id:02d}_training_log_{ts}.csv")
     fieldnames = [
         'fold','epoch',
-        'loss','bce','dice','accuracy','precision','recall','iou',
-        'val_loss','val_bce','val_dice','val_accuracy','val_precision','val_recall','val_iou',
+        'loss','bce','dice','f1','precision','recall','iou',
+        'val_loss','val_bce','val_dice','val_f1','val_precision','val_recall','val_iou',
         'epoch_time','avg_time_per_batch','learning_rate'
     ]
     with open(log_csv, "w", newline="") as f:
@@ -347,7 +343,7 @@ def train_one_fold(dataset, fold_id, train_idx, val_idx, device,
         t0 = time.time()
 
         total_loss = total_bce = total_dice = 0.0
-        total_acc = total_prec = total_rec = total_iou = 0.0
+        total_f1 = total_prec = total_rec = total_iou = 0.0
         nb = 0
 
         for img, mask in train_loader:
@@ -364,9 +360,9 @@ def train_one_fold(dataset, fold_id, train_idx, val_idx, device,
             scaler.step(optimizer)
             scaler.update()
 
-            acc, prec, rec, iou = calculate_metrics_from_logits(logits, mask, thresh=eval_thresh)
+            f1, prec, rec, iou = calculate_metrics_from_logits(logits, mask, thresh=eval_thresh)
             total_loss += loss.item(); total_bce += bce.item(); total_dice += dsc.item()
-            total_acc += acc; total_prec += prec; total_rec += rec; total_iou += iou
+            total_f1 += f1; total_prec += prec; total_rec += rec; total_iou += iou
             nb += 1
 
         scheduler.step()
@@ -378,18 +374,19 @@ def train_one_fold(dataset, fold_id, train_idx, val_idx, device,
         avg_loss = total_loss/nb if nb else 0.0
         avg_bce  = total_bce/nb if nb else 0.0
         avg_dice = total_dice/nb if nb else 0.0
-        avg_acc  = total_acc/nb if nb else 0.0
+        avg_f1   = total_f1/nb if nb else 0.0
         avg_prec = total_prec/nb if nb else 0.0
         avg_rec  = total_rec/nb if nb else 0.0
         avg_iou  = total_iou/nb if nb else 0.0
         lr_now = optimizer.param_groups[0]["lr"]
 
-        (val_loss, val_bce, val_dice, val_acc, val_prec, val_rec, val_iou) = evaluate_epoch(
+        (val_loss, val_bce, val_dice, val_f1, val_prec, val_rec, val_iou) = evaluate_epoch(
             model, val_loader, criterion_bce, device, thresh=eval_thresh, use_amp=use_amp
         )
 
         print(
             f"Fold {fold_id} Epoch {epoch}/{num_epochs} | "
+            f"Train F1={avg_f1:.4f} Val F1={val_f1:.4f} | "
             f"Train IoU={avg_iou:.4f} Val IoU={val_iou:.4f} | "
             f"Train Loss={avg_loss:.4f} Val Loss={val_loss:.4f} | LR={lr_now:.2e}"
         )
@@ -399,9 +396,9 @@ def train_one_fold(dataset, fold_id, train_idx, val_idx, device,
             w.writerow({
                 'fold': fold_id, 'epoch': epoch,
                 'loss': avg_loss, 'bce': avg_bce, 'dice': avg_dice,
-                'accuracy': avg_acc, 'precision': avg_prec, 'recall': avg_rec, 'iou': avg_iou,
+                'f1': avg_f1, 'precision': avg_prec, 'recall': avg_rec, 'iou': avg_iou,
                 'val_loss': val_loss, 'val_bce': val_bce, 'val_dice': val_dice,
-                'val_accuracy': val_acc, 'val_precision': val_prec, 'val_recall': val_rec, 'val_iou': val_iou,
+                'val_f1': val_f1, 'val_precision': val_prec, 'val_recall': val_rec, 'val_iou': val_iou,
                 'epoch_time': epoch_time, 'avg_time_per_batch': avg_time_per_batch, 'learning_rate': lr_now
             })
 
@@ -452,7 +449,7 @@ if __name__ == "__main__":
             train_idx=train_idx.tolist(),
             val_idx=val_idx.tolist(),
             device=device,
-            num_epochs=50,
+            num_epochs=100,
             lr=3e-4,
             weight_decay=1e-4,
             batch_size=8,
