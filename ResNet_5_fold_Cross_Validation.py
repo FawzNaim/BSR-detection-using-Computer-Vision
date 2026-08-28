@@ -1,8 +1,8 @@
 import os
 import gc
 import cv2
-import time
 import csv
+import time
 import random
 import numpy as np
 import pandas as pd
@@ -35,22 +35,22 @@ PARAMS = {
     "lr": 3e-4,
     "weight_decay": 1e-4,
 
-    # Loss weights
+    # Weighted BCE + Dice
     "pos_weight": 15.0,
     "bce_weight": 0.5,
     "dice_weight": 0.5,
 
-    # Prediction threshold
+    # Segmentation threshold
     "threshold": 0.5,
 
-    # Image-level oversampling
+    # Positive-image oversampling
     "positive_sampling_weight": 5.0,
 
-    # Add your paths here
+    # Add your directories here
     "img_dir": r"images",
     "mask_dir": r"masks",
 
-    # All CSV files and checkpoints will be saved here
+    # Output directory
     "output_dir": "cv_outputs_deeplabv3_resnet50"
 }
 
@@ -73,14 +73,6 @@ def set_seed(seed=42):
 # DATASET
 # ============================================================
 class BSRDataset(Dataset):
-    """
-    Loads BSR images and masks, resizes them to the requested size,
-    binarizes the masks, and applies ImageNet normalization.
-
-    ImageNet normalization is used because the ResNet50 backbone
-    starts with ImageNet-pretrained weights.
-    """
-
     def __init__(self, img_dir, mask_dir, size=512):
         self.img_dir = img_dir
         self.mask_dir = mask_dir
@@ -109,12 +101,20 @@ class BSRDataset(Dataset):
         total_pixels = 0
 
         for filename in candidate_files:
-            image_path = os.path.join(img_dir, filename)
+            image_path = os.path.join(
+                img_dir,
+                filename
+            )
 
             mask_filename = (
-                os.path.splitext(filename)[0] + "_label.png"
+                os.path.splitext(filename)[0]
+                + "_label.png"
             )
-            mask_path = os.path.join(mask_dir, mask_filename)
+
+            mask_path = os.path.join(
+                mask_dir,
+                mask_filename
+            )
 
             image = cv2.imread(image_path)
             mask = cv2.imread(
@@ -131,19 +131,19 @@ class BSRDataset(Dataset):
 
             if mask is None:
                 print(
-                    f"Warning: missing or unreadable mask skipped: "
+                    f"Warning: missing mask skipped: "
                     f"{mask_path}"
                 )
                 continue
 
-            resized_mask = cv2.resize(
+            mask = cv2.resize(
                 mask,
                 (size, size),
                 interpolation=cv2.INTER_NEAREST
             )
 
             positive_count = int(
-                np.sum(resized_mask > 0)
+                np.sum(mask > 0)
             )
 
             self.files.append(filename)
@@ -162,12 +162,15 @@ class BSRDataset(Dataset):
         )
 
         print(
-            f"\nDataset ready: {len(self.files)} image-mask pairs"
+            f"\nDataset ready: "
+            f"{len(self.files)} image-mask pairs"
         )
+
         print(
-            f"Images containing BSR pixels: "
+            f"Images with positive BSR pixels: "
             f"{sum(self.has_pos)}/{len(self.has_pos)}"
         )
+
         print(
             f"Positive pixel fraction: "
             f"{self.positive_pixel_fraction * 100:.4f}%"
@@ -196,14 +199,17 @@ class BSRDataset(Dataset):
         )
 
         mask_filename = (
-            os.path.splitext(filename)[0] + "_label.png"
+            os.path.splitext(filename)[0]
+            + "_label.png"
         )
+
         mask_path = os.path.join(
             self.mask_dir,
             mask_filename
         )
 
         image = cv2.imread(image_path)
+
         mask = cv2.imread(
             mask_path,
             cv2.IMREAD_GRAYSCALE
@@ -243,23 +249,27 @@ class BSRDataset(Dataset):
             / 255.0
         )
 
-        # Normalize using ImageNet mean and standard deviation
-        image = (image - self.mean) / self.std
+        # ImageNet normalization
+        image = (
+            image - self.mean
+        ) / self.std
 
-        # Convert mask to binary values
-        mask = (mask > 0).astype(np.float32)
+        # Convert mask to binary
+        mask = (
+            mask > 0
+        ).astype(np.float32)
 
-        image_tensor = torch.tensor(
+        image = torch.tensor(
             image,
             dtype=torch.float32
         )
 
-        mask_tensor = torch.tensor(
+        mask = torch.tensor(
             mask,
             dtype=torch.float32
         ).unsqueeze(0)
 
-        return image_tensor, mask_tensor
+        return image, mask
 
 
 # ============================================================
@@ -267,17 +277,23 @@ class BSRDataset(Dataset):
 # ============================================================
 def get_deeplab_model():
     """
-    Creates DeepLabV3 with an ImageNet-pretrained ResNet50
-    backbone and a one-channel output for binary segmentation.
+    DeepLabV3 with an ImageNet-pretrained ResNet50 backbone.
+
+    No Microsoft COCO/segmentation weights are loaded.
     """
 
     model = deeplabv3_resnet50(
         weights=None,
-        weights_backbone=ResNet50_Weights.DEFAULT,
+        weights_backbone=(
+            ResNet50_Weights.IMAGENET1K_V2
+        ),
         aux_loss=False
     )
 
-    input_channels = model.classifier[-1].in_channels
+    # Change segmentation output to one binary channel
+    input_channels = (
+        model.classifier[-1].in_channels
+    )
 
     model.classifier[-1] = nn.Conv2d(
         input_channels,
@@ -289,18 +305,13 @@ def get_deeplab_model():
 
 
 # ============================================================
-# LOSS FUNCTIONS
+# DICE LOSS
 # ============================================================
 def dice_loss_from_logits(
     logits,
     targets,
     smooth=1.0
 ):
-    """
-    Calculates soft Dice loss independently for each image,
-    followed by averaging across the batch.
-    """
-
     probabilities = torch.sigmoid(
         logits.float()
     )
@@ -328,38 +339,43 @@ def dice_loss_from_logits(
 
 
 # ============================================================
-# METRICS
+# PIXEL-LEVEL METRICS
 # ============================================================
 def get_confusion_counts(
     logits,
     targets,
     threshold=0.5
 ):
-    """
-    Returns pixel-level TP, FP, and FN counts.
-    """
-
     probabilities = torch.sigmoid(logits)
 
-    predictions = probabilities >= threshold
-    targets = targets >= 0.5
+    predictions = (
+        probabilities >= threshold
+    )
+
+    truth = (
+        targets >= 0.5
+    )
 
     true_positive = torch.logical_and(
         predictions,
-        targets
+        truth
     ).sum().item()
 
     false_positive = torch.logical_and(
         predictions,
-        torch.logical_not(targets)
+        torch.logical_not(truth)
     ).sum().item()
 
     false_negative = torch.logical_and(
         torch.logical_not(predictions),
-        targets
+        truth
     ).sum().item()
 
-    return true_positive, false_positive, false_negative
+    return (
+        true_positive,
+        false_positive,
+        false_negative
+    )
 
 
 def calculate_metrics(
@@ -368,27 +384,25 @@ def calculate_metrics(
     false_negative,
     epsilon=1e-7
 ):
-    """
-    Calculates pixel-level precision, recall, F1, and IoU.
-    Accuracy is intentionally not calculated.
-    """
-
     precision = true_positive / (
-        true_positive + false_positive + epsilon
+        true_positive
+        + false_positive
+        + epsilon
     )
 
     recall = true_positive / (
-        true_positive + false_negative + epsilon
+        true_positive
+        + false_negative
+        + epsilon
     )
 
     f1 = (
         2.0 * true_positive
-        / (
-            2.0 * true_positive
-            + false_positive
-            + false_negative
-            + epsilon
-        )
+    ) / (
+        2.0 * true_positive
+        + false_positive
+        + false_negative
+        + epsilon
     )
 
     iou = true_positive / (
@@ -416,11 +430,6 @@ def write_fold_membership_csv(
     val_indices,
     output_dir
 ):
-    """
-    Records which images belong to the training and validation
-    portions of each fold.
-    """
-
     membership_path = os.path.join(
         output_dir,
         f"fold_{fold_id:02d}_membership.csv"
@@ -448,64 +457,66 @@ def write_fold_membership_csv(
         writer.writeheader()
 
         for index in train_indices:
-            image_filename = dataset.files[index]
+            image_filename = (
+                dataset.files[index]
+            )
+
+            mask_filename = (
+                os.path.splitext(image_filename)[0]
+                + "_label.png"
+            )
 
             writer.writerow({
                 "fold": fold_id,
                 "split": "train",
                 "dataset_index": index,
                 "image_filename": image_filename,
-                "mask_filename": (
-                    os.path.splitext(image_filename)[0]
-                    + "_label.png"
-                ),
+                "mask_filename": mask_filename,
                 "has_positive": int(
                     dataset.has_pos[index]
                 )
             })
 
         for index in val_indices:
-            image_filename = dataset.files[index]
+            image_filename = (
+                dataset.files[index]
+            )
+
+            mask_filename = (
+                os.path.splitext(image_filename)[0]
+                + "_label.png"
+            )
 
             writer.writerow({
                 "fold": fold_id,
                 "split": "validation",
                 "dataset_index": index,
                 "image_filename": image_filename,
-                "mask_filename": (
-                    os.path.splitext(image_filename)[0]
-                    + "_label.png"
-                ),
+                "mask_filename": mask_filename,
                 "has_positive": int(
                     dataset.has_pos[index]
                 )
             })
 
     print(
-        f"Fold membership saved: {membership_path}"
+        f"Fold membership saved: "
+        f"{membership_path}"
     )
 
     return membership_path
 
 
 # ============================================================
-# EVALUATION
+# VALIDATION
 # ============================================================
 def evaluate_epoch(
     model,
     data_loader,
     bce_criterion,
     device,
-    use_amp=True,
-    threshold=0.5
+    threshold=0.5,
+    use_amp=True
 ):
-    """
-    Evaluates one complete validation fold.
-
-    Losses are averaged across batches. Metrics are calculated
-    from TP, FP, and FN accumulated across the entire fold.
-    """
-
     model.eval()
 
     total_loss = 0.0
@@ -518,7 +529,8 @@ def evaluate_epoch(
     total_fn = 0
 
     amp_enabled = (
-        use_amp and device.type == "cuda"
+        use_amp
+        and device.type == "cuda"
     )
 
     with torch.no_grad():
@@ -544,14 +556,18 @@ def evaluate_epoch(
                     masks
                 )
 
-                dice_loss = dice_loss_from_logits(
-                    logits,
-                    masks
+                dice_loss = (
+                    dice_loss_from_logits(
+                        logits,
+                        masks
+                    )
                 )
 
                 combined_loss = (
-                    PARAMS["bce_weight"] * bce_loss
-                    + PARAMS["dice_weight"] * dice_loss
+                    PARAMS["bce_weight"]
+                    * bce_loss
+                    + PARAMS["dice_weight"]
+                    * dice_loss
                 )
 
             total_loss += combined_loss.item()
@@ -587,9 +603,15 @@ def evaluate_epoch(
     )
 
     return {
-        "loss": total_loss / number_of_batches,
-        "bce": total_bce / number_of_batches,
-        "dice": total_dice / number_of_batches,
+        "loss": (
+            total_loss / number_of_batches
+        ),
+        "bce": (
+            total_bce / number_of_batches
+        ),
+        "dice": (
+            total_dice / number_of_batches
+        ),
         "f1": metrics["f1"],
         "precision": metrics["precision"],
         "recall": metrics["recall"],
@@ -612,8 +634,8 @@ def train_one_fold(
     lr=3e-4,
     weight_decay=1e-4,
     positive_sampling_weight=5.0,
-    use_amp=True,
-    threshold=0.5
+    threshold=0.5,
+    use_amp=True
 ):
     train_subset = Subset(
         dataset,
@@ -626,7 +648,7 @@ def train_one_fold(
     )
 
     # --------------------------------------------------------
-    # Oversample positive training images
+    # Oversampling
     # --------------------------------------------------------
     sample_weights = [
         (
@@ -638,6 +660,7 @@ def train_one_fold(
     ]
 
     sampler_generator = torch.Generator()
+
     sampler_generator.manual_seed(
         PARAMS["seed"] + fold_id
     )
@@ -649,6 +672,10 @@ def train_one_fold(
         generator=sampler_generator
     )
 
+    # IMPORTANT:
+    # drop_last=True prevents a final batch of size 1.
+    # DeepLabV3 BatchNorm cannot train on a batch of size 1
+    # after its ASPP pooling branch creates a 1x1 feature map.
     train_loader = DataLoader(
         train_subset,
         batch_size=batch_size,
@@ -656,9 +683,11 @@ def train_one_fold(
         shuffle=False,
         num_workers=PARAMS["num_workers"],
         pin_memory=(device.type == "cuda"),
-        drop_last=False
+        drop_last=True
     )
 
+    # Retain every validation image.
+    # BatchNorm is in evaluation mode during validation.
     val_loader = DataLoader(
         val_subset,
         batch_size=batch_size,
@@ -668,8 +697,16 @@ def train_one_fold(
         drop_last=False
     )
 
+    print(
+        f"Fold {fold_id} loader information | "
+        f"Train images: {len(train_subset)} | "
+        f"Train batches: {len(train_loader)} | "
+        f"Validation images: {len(val_subset)} | "
+        f"Validation batches: {len(val_loader)}"
+    )
+
     # --------------------------------------------------------
-    # Model and training components
+    # Model, loss, optimizer, scheduler, AMP
     # --------------------------------------------------------
     model = get_deeplab_model().to(device)
 
@@ -689,13 +726,17 @@ def train_one_fold(
         weight_decay=weight_decay
     )
 
-    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
-        optimizer,
-        T_max=num_epochs
+    scheduler = (
+        torch.optim.lr_scheduler
+        .CosineAnnealingLR(
+            optimizer,
+            T_max=num_epochs
+        )
     )
 
     amp_enabled = (
-        use_amp and device.type == "cuda"
+        use_amp
+        and device.type == "cuda"
     )
 
     scaler = torch.amp.GradScaler(
@@ -704,7 +745,7 @@ def train_one_fold(
     )
 
     # --------------------------------------------------------
-    # Per-fold CSV setup
+    # Per-fold CSV
     # --------------------------------------------------------
     timestamp = datetime.now().strftime(
         "%Y%m%d_%H%M%S"
@@ -752,10 +793,11 @@ def train_one_fold(
             csv_file,
             fieldnames=fieldnames
         )
+
         writer.writeheader()
 
     # --------------------------------------------------------
-    # Best model tracking
+    # Best-model tracking
     # --------------------------------------------------------
     best_val_iou = -1.0
     best_val_f1 = 0.0
@@ -770,21 +812,21 @@ def train_one_fold(
     )
 
     print(
-        f"\nStarting fold {fold_id} | "
-        f"Train images: {len(train_indices)} | "
-        f"Validation images: {len(val_indices)} | "
+        f"\nStarting Fold {fold_id} | "
         f"Epochs: {num_epochs}"
     )
 
     # --------------------------------------------------------
-    # Training loop
+    # Epoch loop
     # --------------------------------------------------------
-    for epoch in range(1, num_epochs + 1):
+    for epoch in range(
+        1,
+        num_epochs + 1
+    ):
         model.train()
 
         epoch_start_time = time.time()
 
-        # Save the learning rate actually used during this epoch
         current_learning_rate = (
             optimizer.param_groups[0]["lr"]
         )
@@ -824,23 +866,39 @@ def train_one_fold(
                     masks
                 )
 
-                dice_loss = dice_loss_from_logits(
-                    logits,
-                    masks
+                dice_loss = (
+                    dice_loss_from_logits(
+                        logits,
+                        masks
+                    )
                 )
 
                 combined_loss = (
-                    PARAMS["bce_weight"] * bce_loss
-                    + PARAMS["dice_weight"] * dice_loss
+                    PARAMS["bce_weight"]
+                    * bce_loss
+                    + PARAMS["dice_weight"]
+                    * dice_loss
                 )
 
-            scaler.scale(combined_loss).backward()
+            scaler.scale(
+                combined_loss
+            ).backward()
+
             scaler.step(optimizer)
             scaler.update()
 
-            total_train_loss += combined_loss.item()
-            total_train_bce += bce_loss.item()
-            total_train_dice += dice_loss.item()
+            total_train_loss += (
+                combined_loss.item()
+            )
+
+            total_train_bce += (
+                bce_loss.item()
+            )
+
+            total_train_dice += (
+                dice_loss.item()
+            )
+
             number_of_train_batches += 1
 
             tp, fp, fn = get_confusion_counts(
@@ -853,25 +911,27 @@ def train_one_fold(
             train_fp += fp
             train_fn += fn
 
-        if number_of_train_batches > 0:
-            average_train_loss = (
-                total_train_loss
-                / number_of_train_batches
+        if number_of_train_batches == 0:
+            raise RuntimeError(
+                "No training batches were produced. "
+                "The batch size may be larger than the "
+                "training set while drop_last=True."
             )
 
-            average_train_bce = (
-                total_train_bce
-                / number_of_train_batches
-            )
+        average_train_loss = (
+            total_train_loss
+            / number_of_train_batches
+        )
 
-            average_train_dice = (
-                total_train_dice
-                / number_of_train_batches
-            )
-        else:
-            average_train_loss = 0.0
-            average_train_bce = 0.0
-            average_train_dice = 0.0
+        average_train_bce = (
+            total_train_bce
+            / number_of_train_batches
+        )
+
+        average_train_dice = (
+            total_train_dice
+            / number_of_train_batches
+        )
 
         train_metrics = calculate_metrics(
             train_tp,
@@ -887,40 +947,47 @@ def train_one_fold(
             data_loader=val_loader,
             bce_criterion=bce_criterion,
             device=device,
-            use_amp=use_amp,
-            threshold=threshold
+            threshold=threshold,
+            use_amp=use_amp
         )
 
         if device.type == "cuda":
             torch.cuda.synchronize()
 
         epoch_time = (
-            time.time() - epoch_start_time
+            time.time()
+            - epoch_start_time
         )
 
         average_time_per_batch = (
-            epoch_time / number_of_train_batches
-            if number_of_train_batches > 0
-            else 0.0
+            epoch_time
+            / number_of_train_batches
         )
 
         # ----------------------------------------------------
-        # Print epoch results
+        # Display metrics
         # ----------------------------------------------------
         print(
             f"Fold {fold_id} | "
             f"Epoch {epoch:03d}/{num_epochs} | "
-            f"Train Loss: {average_train_loss:.4f} | "
-            f"Val Loss: {validation_metrics['loss']:.4f} | "
-            f"Train F1: {train_metrics['f1']:.4f} | "
-            f"Val F1: {validation_metrics['f1']:.4f} | "
-            f"Train IoU: {train_metrics['iou']:.4f} | "
-            f"Val IoU: {validation_metrics['iou']:.4f} | "
-            f"LR: {current_learning_rate:.2e}"
+            f"Train Loss: "
+            f"{average_train_loss:.4f} | "
+            f"Val Loss: "
+            f"{validation_metrics['loss']:.4f} | "
+            f"Train F1: "
+            f"{train_metrics['f1']:.4f} | "
+            f"Val F1: "
+            f"{validation_metrics['f1']:.4f} | "
+            f"Train IoU: "
+            f"{train_metrics['iou']:.4f} | "
+            f"Val IoU: "
+            f"{validation_metrics['iou']:.4f} | "
+            f"LR: {current_learning_rate:.2e} | "
+            f"Time: {epoch_time:.1f}s"
         )
 
         # ----------------------------------------------------
-        # Save current epoch to fold-specific CSV
+        # Add epoch to fold-specific CSV
         # ----------------------------------------------------
         epoch_row = {
             "fold": fold_id,
@@ -930,7 +997,9 @@ def train_one_fold(
             "bce": average_train_bce,
             "dice": average_train_dice,
             "f1": train_metrics["f1"],
-            "precision": train_metrics["precision"],
+            "precision": (
+                train_metrics["precision"]
+            ),
             "recall": train_metrics["recall"],
             "iou": train_metrics["iou"],
 
@@ -938,8 +1007,12 @@ def train_one_fold(
             "val_bce": validation_metrics["bce"],
             "val_dice": validation_metrics["dice"],
             "val_f1": validation_metrics["f1"],
-            "val_precision": validation_metrics["precision"],
-            "val_recall": validation_metrics["recall"],
+            "val_precision": (
+                validation_metrics["precision"]
+            ),
+            "val_recall": (
+                validation_metrics["recall"]
+            ),
             "val_iou": validation_metrics["iou"],
 
             "epoch_time_seconds": epoch_time,
@@ -958,21 +1031,36 @@ def train_one_fold(
                 csv_file,
                 fieldnames=fieldnames
             )
+
             writer.writerow(epoch_row)
 
         # ----------------------------------------------------
-        # Save best model according to validation IoU
+        # Save best checkpoint according to validation IoU
         # ----------------------------------------------------
-        if validation_metrics["iou"] > best_val_iou:
-            best_val_iou = validation_metrics["iou"]
-            best_val_f1 = validation_metrics["f1"]
+        if (
+            validation_metrics["iou"]
+            > best_val_iou
+        ):
+            best_val_iou = (
+                validation_metrics["iou"]
+            )
+
+            best_val_f1 = (
+                validation_metrics["f1"]
+            )
+
             best_val_precision = (
                 validation_metrics["precision"]
             )
+
             best_val_recall = (
                 validation_metrics["recall"]
             )
-            best_val_loss = validation_metrics["loss"]
+
+            best_val_loss = (
+                validation_metrics["loss"]
+            )
+
             best_epoch = epoch
 
             torch.save(
@@ -985,9 +1073,15 @@ def train_one_fold(
                     "optimizer_state_dict": (
                         optimizer.state_dict()
                     ),
-                    "validation_loss": best_val_loss,
-                    "validation_iou": best_val_iou,
-                    "validation_f1": best_val_f1,
+                    "validation_loss": (
+                        best_val_loss
+                    ),
+                    "validation_iou": (
+                        best_val_iou
+                    ),
+                    "validation_f1": (
+                        best_val_f1
+                    ),
                     "validation_precision": (
                         best_val_precision
                     ),
@@ -1007,27 +1101,51 @@ def train_one_fold(
                 f"Val F1: {best_val_f1:.4f}"
             )
 
-        # Update learning rate for the next epoch
+        # Update LR after finishing the epoch
         scheduler.step()
 
     print(
         f"\nFold {fold_id} completed | "
         f"Best epoch: {best_epoch} | "
         f"Best Val IoU: {best_val_iou:.4f} | "
-        f"Val F1 at best epoch: {best_val_f1:.4f}"
+        f"Val F1 at best epoch: "
+        f"{best_val_f1:.4f}"
     )
 
-    return {
+    result = {
         "fold": fold_id,
         "best_epoch": best_epoch,
         "best_val_loss": best_val_loss,
         "best_val_iou": best_val_iou,
         "best_val_f1": best_val_f1,
-        "best_val_precision": best_val_precision,
-        "best_val_recall": best_val_recall,
-        "best_checkpoint": best_checkpoint_path,
-        "training_log_csv": training_log_path
+        "best_val_precision": (
+            best_val_precision
+        ),
+        "best_val_recall": (
+            best_val_recall
+        ),
+        "best_checkpoint": (
+            best_checkpoint_path
+        ),
+        "training_log_csv": (
+            training_log_path
+        )
     }
+
+    # Explicit fold cleanup
+    del model
+    del optimizer
+    del scheduler
+    del scaler
+    del train_loader
+    del val_loader
+
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+
+    gc.collect()
+
+    return result
 
 
 # ============================================================
@@ -1046,18 +1164,18 @@ def main():
 
     if torch.cuda.is_available():
         print(
-            f"GPU: {torch.cuda.get_device_name(0)}"
+            f"GPU: "
+            f"{torch.cuda.get_device_name(0)}"
         )
+
         print(
-            f"CUDA version: {torch.version.cuda}"
+            f"CUDA version: "
+            f"{torch.version.cuda}"
         )
+
         print(
             f"GPU memory: "
             f"{torch.cuda.get_device_properties(0).total_memory / 1e9:.2f} GB"
-        )
-    else:
-        print(
-            "No CUDA GPU detected. Training will use CPU."
         )
 
     os.makedirs(
@@ -1073,8 +1191,8 @@ def main():
 
     if len(dataset) < PARAMS["num_folds"]:
         raise ValueError(
-            f"Only {len(dataset)} valid images were found, "
-            f"which is insufficient for "
+            f"Only {len(dataset)} valid images were found. "
+            f"This is insufficient for "
             f"{PARAMS['num_folds']}-fold cross-validation."
         )
 
@@ -1084,7 +1202,10 @@ def main():
         random_state=PARAMS["seed"]
     )
 
-    all_indices = np.arange(len(dataset))
+    all_indices = np.arange(
+        len(dataset)
+    )
+
     summary_rows = []
 
     for fold_id, (
@@ -1101,15 +1222,22 @@ def main():
         )
         print("=" * 80)
 
-        train_indices = train_indices.tolist()
-        val_indices = val_indices.tolist()
+        train_indices = (
+            train_indices.tolist()
+        )
 
-        membership_csv = write_fold_membership_csv(
-            dataset=dataset,
-            fold_id=fold_id,
-            train_indices=train_indices,
-            val_indices=val_indices,
-            output_dir=PARAMS["output_dir"]
+        val_indices = (
+            val_indices.tolist()
+        )
+
+        membership_csv = (
+            write_fold_membership_csv(
+                dataset=dataset,
+                fold_id=fold_id,
+                train_indices=train_indices,
+                val_indices=val_indices,
+                output_dir=PARAMS["output_dir"]
+            )
         )
 
         fold_result = train_one_fold(
@@ -1122,37 +1250,45 @@ def main():
             num_epochs=PARAMS["epochs"],
             batch_size=PARAMS["batch_size"],
             lr=PARAMS["lr"],
-            weight_decay=PARAMS["weight_decay"],
-            positive_sampling_weight=(
-                PARAMS["positive_sampling_weight"]
+            weight_decay=(
+                PARAMS["weight_decay"]
             ),
-            use_amp=True,
-            threshold=PARAMS["threshold"]
+            positive_sampling_weight=(
+                PARAMS[
+                    "positive_sampling_weight"
+                ]
+            ),
+            threshold=PARAMS["threshold"],
+            use_amp=True
         )
 
-        fold_result["membership_csv"] = membership_csv
-        summary_rows.append(fold_result)
+        fold_result["membership_csv"] = (
+            membership_csv
+        )
 
-        # Release fold-specific GPU memory
+        summary_rows.append(
+            fold_result
+        )
+
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
 
         gc.collect()
 
     # --------------------------------------------------------
-    # Cross-validation summary
+    # Cross-validation summary CSV
     # --------------------------------------------------------
     summary_dataframe = pd.DataFrame(
         summary_rows
     )
 
-    summary_timestamp = datetime.now().strftime(
+    timestamp = datetime.now().strftime(
         "%Y%m%d_%H%M%S"
     )
 
     summary_path = os.path.join(
         PARAMS["output_dir"],
-        f"cv_summary_{summary_timestamp}.csv"
+        f"cv_summary_{timestamp}.csv"
     )
 
     summary_dataframe.to_csv(
@@ -1183,9 +1319,12 @@ def main():
     for result in summary_rows:
         print(
             f"Fold {result['fold']} | "
-            f"Best epoch: {result['best_epoch']} | "
-            f"Val IoU: {result['best_val_iou']:.4f} | "
-            f"Val F1: {result['best_val_f1']:.4f} | "
+            f"Best epoch: "
+            f"{result['best_epoch']} | "
+            f"Val IoU: "
+            f"{result['best_val_iou']:.4f} | "
+            f"Val F1: "
+            f"{result['best_val_f1']:.4f} | "
             f"Precision: "
             f"{result['best_val_precision']:.4f} | "
             f"Recall: "
@@ -1193,16 +1332,20 @@ def main():
         )
 
     print("-" * 80)
+
     print(
         f"Mean validation IoU: "
         f"{mean_iou:.4f} ± {std_iou:.4f}"
     )
+
     print(
         f"Mean validation F1: "
         f"{mean_f1:.4f} ± {std_f1:.4f}"
     )
+
     print(
-        f"Summary CSV saved to: {summary_path}"
+        f"Summary CSV saved to: "
+        f"{summary_path}"
     )
 
 
