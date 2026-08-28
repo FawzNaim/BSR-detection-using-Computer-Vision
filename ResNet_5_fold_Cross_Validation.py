@@ -1,68 +1,70 @@
 import os
+import gc
 import cv2
+import time
+import csv
 import random
 import numpy as np
+import pandas as pd
 import torch
 import torch.nn as nn
 
+from datetime import datetime
 from torch.utils.data import (
     Dataset,
     DataLoader,
     WeightedRandomSampler,
     Subset
 )
-
 from sklearn.model_selection import KFold
-import torchvision.models.segmentation as models
+from torchvision.models import ResNet50_Weights
+from torchvision.models.segmentation import deeplabv3_resnet50
 
 
 # ============================================================
 # CONFIGURATION
 # ============================================================
-SEED = 42
-
 PARAMS = {
+    "seed": 42,
     "img_size": 512,
     "batch_size": 8,
     "epochs": 100,
+    "num_folds": 5,
+    "num_workers": 2,
+
     "lr": 3e-4,
     "weight_decay": 1e-4,
 
-    # Positive-pixel weight for BCEWithLogitsLoss
+    # Loss weights
     "pos_weight": 15.0,
-
-    # BCE and Dice contribution to total loss
     "bce_weight": 0.5,
     "dice_weight": 0.5,
 
-    # Probability threshold for converting probabilities to masks
+    # Prediction threshold
     "threshold": 0.5,
 
-    # Positive images receive five times the sampling weight
+    # Image-level oversampling
     "positive_sampling_weight": 5.0,
-
-    "num_folds": 5,
-    "num_workers": 2,
 
     # Add your paths here
     "img_dir": r"images",
     "mask_dir": r"masks",
 
-    "checkpoint_dir": "checkpoints"
+    # All CSV files and checkpoints will be saved here
+    "output_dir": "cv_outputs_deeplabv3_resnet50"
 }
 
 
 # ============================================================
 # REPRODUCIBILITY
 # ============================================================
-def setup_env(seed=SEED):
+def set_seed(seed=42):
     random.seed(seed)
     np.random.seed(seed)
 
     torch.manual_seed(seed)
     torch.cuda.manual_seed_all(seed)
 
-    # Deterministic behavior is preferable for cross-validation
     torch.backends.cudnn.deterministic = True
     torch.backends.cudnn.benchmark = False
 
@@ -71,83 +73,156 @@ def setup_env(seed=SEED):
 # DATASET
 # ============================================================
 class BSRDataset(Dataset):
+    """
+    Loads BSR images and masks, resizes them to the requested size,
+    binarizes the masks, and applies ImageNet normalization.
+
+    ImageNet normalization is used because the ResNet50 backbone
+    starts with ImageNet-pretrained weights.
+    """
+
     def __init__(self, img_dir, mask_dir, size=512):
         self.img_dir = img_dir
         self.mask_dir = mask_dir
         self.size = size
 
-        all_files = sorted([
-            f for f in os.listdir(img_dir)
-            if f.lower().endswith(".png")
+        if not os.path.isdir(img_dir):
+            raise FileNotFoundError(
+                f"Image directory was not found: {img_dir}"
+            )
+
+        if not os.path.isdir(mask_dir):
+            raise FileNotFoundError(
+                f"Mask directory was not found: {mask_dir}"
+            )
+
+        candidate_files = sorted([
+            filename
+            for filename in os.listdir(img_dir)
+            if filename.lower().endswith(".png")
         ])
 
-        # Retain only images with corresponding readable masks
         self.files = []
         self.has_pos = []
 
-        pos_pixels = 0
+        total_positive_pixels = 0
         total_pixels = 0
 
-        for fname in all_files:
-            image_path = os.path.join(img_dir, fname)
-            mask_name = os.path.splitext(fname)[0] + "_label.png"
-            mask_path = os.path.join(mask_dir, mask_name)
+        for filename in candidate_files:
+            image_path = os.path.join(img_dir, filename)
+
+            mask_filename = (
+                os.path.splitext(filename)[0] + "_label.png"
+            )
+            mask_path = os.path.join(mask_dir, mask_filename)
 
             image = cv2.imread(image_path)
-            mask = cv2.imread(mask_path, cv2.IMREAD_GRAYSCALE)
+            mask = cv2.imread(
+                mask_path,
+                cv2.IMREAD_GRAYSCALE
+            )
 
             if image is None:
-                print(f"Warning: could not read image: {image_path}")
+                print(
+                    f"Warning: unreadable image skipped: "
+                    f"{image_path}"
+                )
                 continue
 
             if mask is None:
-                print(f"Warning: could not read mask: {mask_path}")
+                print(
+                    f"Warning: missing or unreadable mask skipped: "
+                    f"{mask_path}"
+                )
                 continue
 
-            mask = cv2.resize(
+            resized_mask = cv2.resize(
                 mask,
                 (size, size),
                 interpolation=cv2.INTER_NEAREST
             )
 
-            positive_count = np.sum(mask > 0)
+            positive_count = int(
+                np.sum(resized_mask > 0)
+            )
 
-            self.files.append(fname)
+            self.files.append(filename)
             self.has_pos.append(positive_count > 0)
 
-            pos_pixels += positive_count
+            total_positive_pixels += positive_count
             total_pixels += size * size
 
         if len(self.files) == 0:
             raise RuntimeError(
-                "No valid image-mask pairs were found. "
-                "Check img_dir, mask_dir, and mask filenames."
+                "No valid image-mask pairs were found."
             )
 
-        self.calculated_pos_weight = (
-            (total_pixels - pos_pixels) / (pos_pixels + 1e-7)
+        self.positive_pixel_fraction = (
+            total_positive_pixels / total_pixels
         )
 
         print(
-            f"Dataset ready: {len(self.files)} valid image-mask pairs\n"
-            f"Calculated pixel pos_weight: "
-            f"{self.calculated_pos_weight:.2f}"
+            f"\nDataset ready: {len(self.files)} image-mask pairs"
         )
+        print(
+            f"Images containing BSR pixels: "
+            f"{sum(self.has_pos)}/{len(self.has_pos)}"
+        )
+        print(
+            f"Positive pixel fraction: "
+            f"{self.positive_pixel_fraction * 100:.4f}%"
+        )
+
+        # ImageNet normalization
+        self.mean = np.array(
+            [0.485, 0.456, 0.406],
+            dtype=np.float32
+        ).reshape(3, 1, 1)
+
+        self.std = np.array(
+            [0.229, 0.224, 0.225],
+            dtype=np.float32
+        ).reshape(3, 1, 1)
 
     def __len__(self):
         return len(self.files)
 
-    def __getitem__(self, idx):
-        fname = self.files[idx]
+    def __getitem__(self, index):
+        filename = self.files[index]
 
-        image_path = os.path.join(self.img_dir, fname)
-        mask_name = os.path.splitext(fname)[0] + "_label.png"
-        mask_path = os.path.join(self.mask_dir, mask_name)
+        image_path = os.path.join(
+            self.img_dir,
+            filename
+        )
+
+        mask_filename = (
+            os.path.splitext(filename)[0] + "_label.png"
+        )
+        mask_path = os.path.join(
+            self.mask_dir,
+            mask_filename
+        )
 
         image = cv2.imread(image_path)
-        mask = cv2.imread(mask_path, cv2.IMREAD_GRAYSCALE)
+        mask = cv2.imread(
+            mask_path,
+            cv2.IMREAD_GRAYSCALE
+        )
 
-        image = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
+        if image is None:
+            raise FileNotFoundError(
+                f"Image could not be read: {image_path}"
+            )
+
+        if mask is None:
+            raise FileNotFoundError(
+                f"Mask could not be read: {mask_path}"
+            )
+
+        image = cv2.cvtColor(
+            image,
+            cv2.COLOR_BGR2RGB
+        )
 
         image = cv2.resize(
             image,
@@ -161,175 +236,442 @@ class BSRDataset(Dataset):
             interpolation=cv2.INTER_NEAREST
         )
 
-        # Image shape: [C, H, W], values between 0 and 1
-        image = torch.from_numpy(
+        # Convert image to [C, H, W] and scale to [0, 1]
+        image = (
             image.transpose(2, 0, 1)
-        ).float() / 255.0
+            .astype(np.float32)
+            / 255.0
+        )
 
-        # Binary mask shape: [1, H, W]
-        mask = torch.from_numpy(
-            (mask > 0).astype(np.float32)
+        # Normalize using ImageNet mean and standard deviation
+        image = (image - self.mean) / self.std
+
+        # Convert mask to binary values
+        mask = (mask > 0).astype(np.float32)
+
+        image_tensor = torch.tensor(
+            image,
+            dtype=torch.float32
+        )
+
+        mask_tensor = torch.tensor(
+            mask,
+            dtype=torch.float32
         ).unsqueeze(0)
 
-        return image, mask
+        return image_tensor, mask_tensor
 
 
 # ============================================================
 # MODEL
 # ============================================================
-def get_segmentation_model(name="deeplabv3_resnet50"):
-    if name == "deeplabv3_resnet50":
-        model = models.deeplabv3_resnet50(weights="DEFAULT")
+def get_deeplab_model():
+    """
+    Creates DeepLabV3 with an ImageNet-pretrained ResNet50
+    backbone and a one-channel output for binary segmentation.
+    """
 
-        # Replace the multiclass output layer with one binary channel
-        in_channels = model.classifier[-1].in_channels
-        model.classifier[-1] = nn.Conv2d(
-            in_channels,
-            1,
-            kernel_size=1
-        )
+    model = deeplabv3_resnet50(
+        weights=None,
+        weights_backbone=ResNet50_Weights.DEFAULT,
+        aux_loss=False
+    )
 
-        if model.aux_classifier is not None:
-            aux_in_channels = model.aux_classifier[-1].in_channels
-            model.aux_classifier[-1] = nn.Conv2d(
-                aux_in_channels,
-                1,
-                kernel_size=1
-            )
+    input_channels = model.classifier[-1].in_channels
 
-    elif name == "fcn_resnet50":
-        model = models.fcn_resnet50(weights="DEFAULT")
-
-        in_channels = model.classifier[-1].in_channels
-        model.classifier[-1] = nn.Conv2d(
-            in_channels,
-            1,
-            kernel_size=1
-        )
-
-        if model.aux_classifier is not None:
-            aux_in_channels = model.aux_classifier[-1].in_channels
-            model.aux_classifier[-1] = nn.Conv2d(
-                aux_in_channels,
-                1,
-                kernel_size=1
-            )
-
-    else:
-        raise ValueError(f"Unsupported model name: {name}")
+    model.classifier[-1] = nn.Conv2d(
+        input_channels,
+        1,
+        kernel_size=1
+    )
 
     return model
 
 
 # ============================================================
-# DICE LOSS
+# LOSS FUNCTIONS
 # ============================================================
-class DiceLoss(nn.Module):
-    def __init__(self, smooth=1.0):
-        super().__init__()
-        self.smooth = smooth
+def dice_loss_from_logits(
+    logits,
+    targets,
+    smooth=1.0
+):
+    """
+    Calculates soft Dice loss independently for each image,
+    followed by averaging across the batch.
+    """
 
-    def forward(self, logits, targets):
-        # Convert logits to probabilities
-        probabilities = torch.sigmoid(logits.float())
-        targets = targets.float()
+    probabilities = torch.sigmoid(
+        logits.float()
+    )
 
-        # Calculate Dice independently for every image
-        dimensions = (1, 2, 3)
+    targets = targets.float()
 
-        intersection = (
-            probabilities * targets
-        ).sum(dim=dimensions)
+    dimensions = (1, 2, 3)
 
-        denominator = (
-            probabilities.sum(dim=dimensions)
-            + targets.sum(dim=dimensions)
-        )
+    intersection = (
+        probabilities * targets
+    ).sum(dim=dimensions)
 
-        dice_score = (
-            2.0 * intersection + self.smooth
-        ) / (
-            denominator + self.smooth
-        )
+    denominator = (
+        probabilities.sum(dim=dimensions)
+        + targets.sum(dim=dimensions)
+    )
 
-        return 1.0 - dice_score.mean()
+    dice_score = (
+        2.0 * intersection + smooth
+    ) / (
+        denominator + smooth
+    )
+
+    return 1.0 - dice_score.mean()
 
 
 # ============================================================
-# METRIC CALCULATION
+# METRICS
 # ============================================================
-def update_confusion_counts(
+def get_confusion_counts(
     logits,
     targets,
     threshold=0.5
 ):
+    """
+    Returns pixel-level TP, FP, and FN counts.
+    """
+
     probabilities = torch.sigmoid(logits)
+
     predictions = probabilities >= threshold
-    truth = targets >= 0.5
+    targets = targets >= 0.5
 
     true_positive = torch.logical_and(
         predictions,
-        truth
+        targets
     ).sum().item()
 
     false_positive = torch.logical_and(
         predictions,
-        torch.logical_not(truth)
+        torch.logical_not(targets)
     ).sum().item()
 
     false_negative = torch.logical_and(
         torch.logical_not(predictions),
-        truth
+        targets
     ).sum().item()
 
     return true_positive, false_positive, false_negative
 
 
-def calculate_metrics(tp, fp, fn, epsilon=1e-7):
-    precision = tp / (tp + fp + epsilon)
-    recall = tp / (tp + fn + epsilon)
+def calculate_metrics(
+    true_positive,
+    false_positive,
+    false_negative,
+    epsilon=1e-7
+):
+    """
+    Calculates pixel-level precision, recall, F1, and IoU.
+    Accuracy is intentionally not calculated.
+    """
 
-    f1 = (
-        2.0 * precision * recall
-        / (precision + recall + epsilon)
+    precision = true_positive / (
+        true_positive + false_positive + epsilon
     )
 
-    iou = tp / (tp + fp + fn + epsilon)
+    recall = true_positive / (
+        true_positive + false_negative + epsilon
+    )
+
+    f1 = (
+        2.0 * true_positive
+        / (
+            2.0 * true_positive
+            + false_positive
+            + false_negative
+            + epsilon
+        )
+    )
+
+    iou = true_positive / (
+        true_positive
+        + false_positive
+        + false_negative
+        + epsilon
+    )
 
     return {
-        "iou": iou,
         "f1": f1,
         "precision": precision,
-        "recall": recall
+        "recall": recall,
+        "iou": iou
+    }
+
+
+# ============================================================
+# FOLD MEMBERSHIP CSV
+# ============================================================
+def write_fold_membership_csv(
+    dataset,
+    fold_id,
+    train_indices,
+    val_indices,
+    output_dir
+):
+    """
+    Records which images belong to the training and validation
+    portions of each fold.
+    """
+
+    membership_path = os.path.join(
+        output_dir,
+        f"fold_{fold_id:02d}_membership.csv"
+    )
+
+    fieldnames = [
+        "fold",
+        "split",
+        "dataset_index",
+        "image_filename",
+        "mask_filename",
+        "has_positive"
+    ]
+
+    with open(
+        membership_path,
+        "w",
+        newline=""
+    ) as csv_file:
+        writer = csv.DictWriter(
+            csv_file,
+            fieldnames=fieldnames
+        )
+
+        writer.writeheader()
+
+        for index in train_indices:
+            image_filename = dataset.files[index]
+
+            writer.writerow({
+                "fold": fold_id,
+                "split": "train",
+                "dataset_index": index,
+                "image_filename": image_filename,
+                "mask_filename": (
+                    os.path.splitext(image_filename)[0]
+                    + "_label.png"
+                ),
+                "has_positive": int(
+                    dataset.has_pos[index]
+                )
+            })
+
+        for index in val_indices:
+            image_filename = dataset.files[index]
+
+            writer.writerow({
+                "fold": fold_id,
+                "split": "validation",
+                "dataset_index": index,
+                "image_filename": image_filename,
+                "mask_filename": (
+                    os.path.splitext(image_filename)[0]
+                    + "_label.png"
+                ),
+                "has_positive": int(
+                    dataset.has_pos[index]
+                )
+            })
+
+    print(
+        f"Fold membership saved: {membership_path}"
+    )
+
+    return membership_path
+
+
+# ============================================================
+# EVALUATION
+# ============================================================
+def evaluate_epoch(
+    model,
+    data_loader,
+    bce_criterion,
+    device,
+    use_amp=True,
+    threshold=0.5
+):
+    """
+    Evaluates one complete validation fold.
+
+    Losses are averaged across batches. Metrics are calculated
+    from TP, FP, and FN accumulated across the entire fold.
+    """
+
+    model.eval()
+
+    total_loss = 0.0
+    total_bce = 0.0
+    total_dice = 0.0
+    number_of_batches = 0
+
+    total_tp = 0
+    total_fp = 0
+    total_fn = 0
+
+    amp_enabled = (
+        use_amp and device.type == "cuda"
+    )
+
+    with torch.no_grad():
+        for images, masks in data_loader:
+            images = images.to(
+                device,
+                non_blocking=True
+            )
+
+            masks = masks.to(
+                device,
+                non_blocking=True
+            )
+
+            with torch.amp.autocast(
+                device_type=device.type,
+                enabled=amp_enabled
+            ):
+                logits = model(images)["out"]
+
+                bce_loss = bce_criterion(
+                    logits,
+                    masks
+                )
+
+                dice_loss = dice_loss_from_logits(
+                    logits,
+                    masks
+                )
+
+                combined_loss = (
+                    PARAMS["bce_weight"] * bce_loss
+                    + PARAMS["dice_weight"] * dice_loss
+                )
+
+            total_loss += combined_loss.item()
+            total_bce += bce_loss.item()
+            total_dice += dice_loss.item()
+            number_of_batches += 1
+
+            tp, fp, fn = get_confusion_counts(
+                logits,
+                masks,
+                threshold=threshold
+            )
+
+            total_tp += tp
+            total_fp += fp
+            total_fn += fn
+
+    if number_of_batches == 0:
+        return {
+            "loss": 0.0,
+            "bce": 0.0,
+            "dice": 0.0,
+            "f1": 0.0,
+            "precision": 0.0,
+            "recall": 0.0,
+            "iou": 0.0
+        }
+
+    metrics = calculate_metrics(
+        total_tp,
+        total_fp,
+        total_fn
+    )
+
+    return {
+        "loss": total_loss / number_of_batches,
+        "bce": total_bce / number_of_batches,
+        "dice": total_dice / number_of_batches,
+        "f1": metrics["f1"],
+        "precision": metrics["precision"],
+        "recall": metrics["recall"],
+        "iou": metrics["iou"]
     }
 
 
 # ============================================================
 # TRAIN ONE FOLD
 # ============================================================
-def train_fold(
-    fold_idx,
-    train_loader,
-    val_loader,
+def train_one_fold(
+    dataset,
+    fold_id,
+    train_indices,
+    val_indices,
     device,
-    epochs=100
+    output_dir,
+    num_epochs=100,
+    batch_size=8,
+    lr=3e-4,
+    weight_decay=1e-4,
+    positive_sampling_weight=5.0,
+    use_amp=True,
+    threshold=0.5
 ):
-    print(f"\nStarting fold {fold_idx}")
-
-    model = get_segmentation_model(
-        name="deeplabv3_resnet50"
-    ).to(device)
-
-    optimizer = torch.optim.AdamW(
-        model.parameters(),
-        lr=PARAMS["lr"],
-        weight_decay=PARAMS["weight_decay"]
+    train_subset = Subset(
+        dataset,
+        train_indices
     )
 
-    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
-        optimizer,
-        T_max=epochs
+    val_subset = Subset(
+        dataset,
+        val_indices
     )
+
+    # --------------------------------------------------------
+    # Oversample positive training images
+    # --------------------------------------------------------
+    sample_weights = [
+        (
+            positive_sampling_weight
+            if dataset.has_pos[index]
+            else 1.0
+        )
+        for index in train_indices
+    ]
+
+    sampler_generator = torch.Generator()
+    sampler_generator.manual_seed(
+        PARAMS["seed"] + fold_id
+    )
+
+    train_sampler = WeightedRandomSampler(
+        weights=sample_weights,
+        num_samples=len(train_indices),
+        replacement=True,
+        generator=sampler_generator
+    )
+
+    train_loader = DataLoader(
+        train_subset,
+        batch_size=batch_size,
+        sampler=train_sampler,
+        shuffle=False,
+        num_workers=PARAMS["num_workers"],
+        pin_memory=(device.type == "cuda"),
+        drop_last=False
+    )
+
+    val_loader = DataLoader(
+        val_subset,
+        batch_size=batch_size,
+        shuffle=False,
+        num_workers=PARAMS["num_workers"],
+        pin_memory=(device.type == "cuda"),
+        drop_last=False
+    )
+
+    # --------------------------------------------------------
+    # Model and training components
+    # --------------------------------------------------------
+    model = get_deeplab_model().to(device)
 
     positive_weight = torch.tensor(
         [PARAMS["pos_weight"]],
@@ -337,44 +679,124 @@ def train_fold(
         device=device
     )
 
-    bce_loss_function = nn.BCEWithLogitsLoss(
+    bce_criterion = nn.BCEWithLogitsLoss(
         pos_weight=positive_weight
     )
 
-    dice_loss_function = DiceLoss(smooth=1.0)
+    optimizer = torch.optim.AdamW(
+        model.parameters(),
+        lr=lr,
+        weight_decay=weight_decay
+    )
 
-    # AMP is enabled only when training on a CUDA GPU
-    amp_enabled = device.type == "cuda"
+    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+        optimizer,
+        T_max=num_epochs
+    )
+
+    amp_enabled = (
+        use_amp and device.type == "cuda"
+    )
+
     scaler = torch.amp.GradScaler(
         "cuda",
         enabled=amp_enabled
     )
 
-    best_iou = -1.0
-    best_f1 = 0.0
+    # --------------------------------------------------------
+    # Per-fold CSV setup
+    # --------------------------------------------------------
+    timestamp = datetime.now().strftime(
+        "%Y%m%d_%H%M%S"
+    )
+
+    training_log_path = os.path.join(
+        output_dir,
+        (
+            f"fold_{fold_id:02d}_"
+            f"training_log_{timestamp}.csv"
+        )
+    )
+
+    fieldnames = [
+        "fold",
+        "epoch",
+
+        "loss",
+        "bce",
+        "dice",
+        "f1",
+        "precision",
+        "recall",
+        "iou",
+
+        "val_loss",
+        "val_bce",
+        "val_dice",
+        "val_f1",
+        "val_precision",
+        "val_recall",
+        "val_iou",
+
+        "epoch_time_seconds",
+        "average_time_per_train_batch",
+        "learning_rate"
+    ]
+
+    with open(
+        training_log_path,
+        "w",
+        newline=""
+    ) as csv_file:
+        writer = csv.DictWriter(
+            csv_file,
+            fieldnames=fieldnames
+        )
+        writer.writeheader()
+
+    # --------------------------------------------------------
+    # Best model tracking
+    # --------------------------------------------------------
+    best_val_iou = -1.0
+    best_val_f1 = 0.0
+    best_val_precision = 0.0
+    best_val_recall = 0.0
+    best_val_loss = float("inf")
     best_epoch = 0
 
-    os.makedirs(
-        PARAMS["checkpoint_dir"],
-        exist_ok=True
+    best_checkpoint_path = os.path.join(
+        output_dir,
+        f"fold_{fold_id:02d}_best.pth"
     )
 
-    checkpoint_path = os.path.join(
-        PARAMS["checkpoint_dir"],
-        f"best_f{fold_idx}.pth"
+    print(
+        f"\nStarting fold {fold_id} | "
+        f"Train images: {len(train_indices)} | "
+        f"Validation images: {len(val_indices)} | "
+        f"Epochs: {num_epochs}"
     )
 
-    for epoch in range(epochs):
-        # ----------------------------------------------------
-        # Training
-        # ----------------------------------------------------
+    # --------------------------------------------------------
+    # Training loop
+    # --------------------------------------------------------
+    for epoch in range(1, num_epochs + 1):
         model.train()
 
-        train_losses = []
-        train_bce_losses = []
-        train_dice_losses = []
+        epoch_start_time = time.time()
 
-        start_time = time.time()
+        # Save the learning rate actually used during this epoch
+        current_learning_rate = (
+            optimizer.param_groups[0]["lr"]
+        )
+
+        total_train_loss = 0.0
+        total_train_bce = 0.0
+        total_train_dice = 0.0
+        number_of_train_batches = 0
+
+        train_tp = 0
+        train_fp = 0
+        train_fn = 0
 
         for images, masks in train_loader:
             images = images.to(
@@ -387,176 +809,261 @@ def train_fold(
                 non_blocking=True
             )
 
-            optimizer.zero_grad(set_to_none=True)
+            optimizer.zero_grad(
+                set_to_none=True
+            )
 
             with torch.amp.autocast(
                 device_type=device.type,
                 enabled=amp_enabled
             ):
-                output = model(images)["out"]
+                logits = model(images)["out"]
 
-                bce_loss = bce_loss_function(
-                    output,
+                bce_loss = bce_criterion(
+                    logits,
                     masks
                 )
 
-                dice_loss = dice_loss_function(
-                    output,
+                dice_loss = dice_loss_from_logits(
+                    logits,
                     masks
                 )
 
-                total_loss = (
+                combined_loss = (
                     PARAMS["bce_weight"] * bce_loss
                     + PARAMS["dice_weight"] * dice_loss
                 )
 
-            scaler.scale(total_loss).backward()
+            scaler.scale(combined_loss).backward()
             scaler.step(optimizer)
             scaler.update()
 
-            train_losses.append(total_loss.item())
-            train_bce_losses.append(bce_loss.item())
-            train_dice_losses.append(dice_loss.item())
+            total_train_loss += combined_loss.item()
+            total_train_bce += bce_loss.item()
+            total_train_dice += dice_loss.item()
+            number_of_train_batches += 1
 
-        scheduler.step()
+            tp, fp, fn = get_confusion_counts(
+                logits,
+                masks,
+                threshold=threshold
+            )
 
-        mean_train_loss = np.mean(train_losses)
-        mean_bce_loss = np.mean(train_bce_losses)
-        mean_dice_loss = np.mean(train_dice_losses)
+            train_tp += tp
+            train_fp += fp
+            train_fn += fn
+
+        if number_of_train_batches > 0:
+            average_train_loss = (
+                total_train_loss
+                / number_of_train_batches
+            )
+
+            average_train_bce = (
+                total_train_bce
+                / number_of_train_batches
+            )
+
+            average_train_dice = (
+                total_train_dice
+                / number_of_train_batches
+            )
+        else:
+            average_train_loss = 0.0
+            average_train_bce = 0.0
+            average_train_dice = 0.0
+
+        train_metrics = calculate_metrics(
+            train_tp,
+            train_fp,
+            train_fn
+        )
 
         # ----------------------------------------------------
         # Validation
         # ----------------------------------------------------
-        model.eval()
-
-        val_losses = []
-        total_tp = 0
-        total_fp = 0
-        total_fn = 0
-
-        with torch.no_grad():
-            for images, masks in val_loader:
-                images = images.to(
-                    device,
-                    non_blocking=True
-                )
-
-                masks = masks.to(
-                    device,
-                    non_blocking=True
-                )
-
-                with torch.amp.autocast(
-                    device_type=device.type,
-                    enabled=amp_enabled
-                ):
-                    output = model(images)["out"]
-
-                    val_bce_loss = bce_loss_function(
-                        output,
-                        masks
-                    )
-
-                    val_dice_loss = dice_loss_function(
-                        output,
-                        masks
-                    )
-
-                    val_total_loss = (
-                        PARAMS["bce_weight"] * val_bce_loss
-                        + PARAMS["dice_weight"] * val_dice_loss
-                    )
-
-                val_losses.append(val_total_loss.item())
-
-                tp, fp, fn = update_confusion_counts(
-                    output,
-                    masks,
-                    threshold=PARAMS["threshold"]
-                )
-
-                total_tp += tp
-                total_fp += fp
-                total_fn += fn
-
-        mean_val_loss = np.mean(val_losses)
-
-        val_metrics = calculate_metrics(
-            total_tp,
-            total_fp,
-            total_fn
+        validation_metrics = evaluate_epoch(
+            model=model,
+            data_loader=val_loader,
+            bce_criterion=bce_criterion,
+            device=device,
+            use_amp=use_amp,
+            threshold=threshold
         )
 
-        val_iou = val_metrics["iou"]
-        val_f1 = val_metrics["f1"]
-        val_precision = val_metrics["precision"]
-        val_recall = val_metrics["recall"]
+        if device.type == "cuda":
+            torch.cuda.synchronize()
 
-        elapsed_time = time.time() - start_time
-        current_lr = optimizer.param_groups[0]["lr"]
+        epoch_time = (
+            time.time() - epoch_start_time
+        )
 
+        average_time_per_batch = (
+            epoch_time / number_of_train_batches
+            if number_of_train_batches > 0
+            else 0.0
+        )
+
+        # ----------------------------------------------------
+        # Print epoch results
+        # ----------------------------------------------------
         print(
-            f"Fold {fold_idx} | "
-            f"Epoch {epoch + 1:03d}/{epochs} | "
-            f"Train Loss: {mean_train_loss:.4f} | "
-            f"BCE: {mean_bce_loss:.4f} | "
-            f"Dice: {mean_dice_loss:.4f} | "
-            f"Val Loss: {mean_val_loss:.4f} | "
-            f"Val IoU: {val_iou:.4f} | "
-            f"Val F1: {val_f1:.4f} | "
-            f"Precision: {val_precision:.4f} | "
-            f"Recall: {val_recall:.4f} | "
-            f"LR: {current_lr:.2e} | "
-            f"Time: {elapsed_time:.1f}s"
+            f"Fold {fold_id} | "
+            f"Epoch {epoch:03d}/{num_epochs} | "
+            f"Train Loss: {average_train_loss:.4f} | "
+            f"Val Loss: {validation_metrics['loss']:.4f} | "
+            f"Train F1: {train_metrics['f1']:.4f} | "
+            f"Val F1: {validation_metrics['f1']:.4f} | "
+            f"Train IoU: {train_metrics['iou']:.4f} | "
+            f"Val IoU: {validation_metrics['iou']:.4f} | "
+            f"LR: {current_learning_rate:.2e}"
         )
 
-        # Save using validation IoU
-        if val_iou > best_iou:
-            best_iou = val_iou
-            best_f1 = val_f1
-            best_epoch = epoch + 1
+        # ----------------------------------------------------
+        # Save current epoch to fold-specific CSV
+        # ----------------------------------------------------
+        epoch_row = {
+            "fold": fold_id,
+            "epoch": epoch,
+
+            "loss": average_train_loss,
+            "bce": average_train_bce,
+            "dice": average_train_dice,
+            "f1": train_metrics["f1"],
+            "precision": train_metrics["precision"],
+            "recall": train_metrics["recall"],
+            "iou": train_metrics["iou"],
+
+            "val_loss": validation_metrics["loss"],
+            "val_bce": validation_metrics["bce"],
+            "val_dice": validation_metrics["dice"],
+            "val_f1": validation_metrics["f1"],
+            "val_precision": validation_metrics["precision"],
+            "val_recall": validation_metrics["recall"],
+            "val_iou": validation_metrics["iou"],
+
+            "epoch_time_seconds": epoch_time,
+            "average_time_per_train_batch": (
+                average_time_per_batch
+            ),
+            "learning_rate": current_learning_rate
+        }
+
+        with open(
+            training_log_path,
+            "a",
+            newline=""
+        ) as csv_file:
+            writer = csv.DictWriter(
+                csv_file,
+                fieldnames=fieldnames
+            )
+            writer.writerow(epoch_row)
+
+        # ----------------------------------------------------
+        # Save best model according to validation IoU
+        # ----------------------------------------------------
+        if validation_metrics["iou"] > best_val_iou:
+            best_val_iou = validation_metrics["iou"]
+            best_val_f1 = validation_metrics["f1"]
+            best_val_precision = (
+                validation_metrics["precision"]
+            )
+            best_val_recall = (
+                validation_metrics["recall"]
+            )
+            best_val_loss = validation_metrics["loss"]
+            best_epoch = epoch
 
             torch.save(
                 {
-                    "fold": fold_idx,
+                    "fold": fold_id,
                     "epoch": best_epoch,
-                    "model_state_dict": model.state_dict(),
-                    "optimizer_state_dict": optimizer.state_dict(),
-                    "validation_iou": best_iou,
-                    "validation_f1": best_f1,
-                    "validation_precision": val_precision,
-                    "validation_recall": val_recall,
+                    "model_state_dict": (
+                        model.state_dict()
+                    ),
+                    "optimizer_state_dict": (
+                        optimizer.state_dict()
+                    ),
+                    "validation_loss": best_val_loss,
+                    "validation_iou": best_val_iou,
+                    "validation_f1": best_val_f1,
+                    "validation_precision": (
+                        best_val_precision
+                    ),
+                    "validation_recall": (
+                        best_val_recall
+                    ),
                     "parameters": PARAMS
                 },
-                checkpoint_path
+                best_checkpoint_path
             )
 
+            print(
+                f"New best checkpoint | "
+                f"Fold {fold_id} | "
+                f"Epoch {best_epoch} | "
+                f"Val IoU: {best_val_iou:.4f} | "
+                f"Val F1: {best_val_f1:.4f}"
+            )
+
+        # Update learning rate for the next epoch
+        scheduler.step()
+
     print(
-        f"\nFold {fold_idx} complete | "
+        f"\nFold {fold_id} completed | "
         f"Best epoch: {best_epoch} | "
-        f"Best IoU: {best_iou:.4f} | "
-        f"F1 at best epoch: {best_f1:.4f}"
+        f"Best Val IoU: {best_val_iou:.4f} | "
+        f"Val F1 at best epoch: {best_val_f1:.4f}"
     )
 
     return {
-        "fold": fold_idx,
+        "fold": fold_id,
         "best_epoch": best_epoch,
-        "iou": best_iou,
-        "f1": best_f1
+        "best_val_loss": best_val_loss,
+        "best_val_iou": best_val_iou,
+        "best_val_f1": best_val_f1,
+        "best_val_precision": best_val_precision,
+        "best_val_recall": best_val_recall,
+        "best_checkpoint": best_checkpoint_path,
+        "training_log_csv": training_log_path
     }
 
 
 # ============================================================
-# FIVE-FOLD CROSS-VALIDATION
+# MAIN: FIVE-FOLD CROSS-VALIDATION
 # ============================================================
 def main():
-    setup_env()
+    set_seed(PARAMS["seed"])
 
     device = torch.device(
-        "cuda" if torch.cuda.is_available() else "cpu"
+        "cuda"
+        if torch.cuda.is_available()
+        else "cpu"
     )
 
-    print(f"Device: {device}")
+    print(f"Using device: {device}")
+
+    if torch.cuda.is_available():
+        print(
+            f"GPU: {torch.cuda.get_device_name(0)}"
+        )
+        print(
+            f"CUDA version: {torch.version.cuda}"
+        )
+        print(
+            f"GPU memory: "
+            f"{torch.cuda.get_device_properties(0).total_memory / 1e9:.2f} GB"
+        )
+    else:
+        print(
+            "No CUDA GPU detected. Training will use CPU."
+        )
+
+    os.makedirs(
+        PARAMS["output_dir"],
+        exist_ok=True
+    )
 
     dataset = BSRDataset(
         img_dir=PARAMS["img_dir"],
@@ -566,7 +1073,7 @@ def main():
 
     if len(dataset) < PARAMS["num_folds"]:
         raise ValueError(
-            f"The dataset contains only {len(dataset)} images, "
+            f"Only {len(dataset)} valid images were found, "
             f"which is insufficient for "
             f"{PARAMS['num_folds']}-fold cross-validation."
         )
@@ -574,117 +1081,128 @@ def main():
     kfold = KFold(
         n_splits=PARAMS["num_folds"],
         shuffle=True,
-        random_state=SEED
+        random_state=PARAMS["seed"]
     )
 
-    fold_results = []
+    all_indices = np.arange(len(dataset))
+    summary_rows = []
 
-    for fold_idx, (train_indices, val_indices) in enumerate(
-        kfold.split(np.arange(len(dataset))),
+    for fold_id, (
+        train_indices,
+        val_indices
+    ) in enumerate(
+        kfold.split(all_indices),
         start=1
     ):
-        print("\n" + "=" * 70)
+        print("\n" + "=" * 80)
         print(
-            f"Fold {fold_idx}/{PARAMS['num_folds']} | "
-            f"Training images: {len(train_indices)} | "
-            f"Validation images: {len(val_indices)}"
+            f"STARTING FOLD "
+            f"{fold_id}/{PARAMS['num_folds']}"
         )
-        print("=" * 70)
+        print("=" * 80)
 
-        # Oversampling weights for the training portion only
-        training_positive_flags = [
-            dataset.has_pos[index]
-            for index in train_indices
-        ]
+        train_indices = train_indices.tolist()
+        val_indices = val_indices.tolist()
 
-        sampling_weights = [
-            PARAMS["positive_sampling_weight"]
-            if has_positive_pixels
-            else 1.0
-            for has_positive_pixels in training_positive_flags
-        ]
-
-        sampler_generator = torch.Generator()
-        sampler_generator.manual_seed(SEED + fold_idx)
-
-        sampler = WeightedRandomSampler(
-            weights=sampling_weights,
-            num_samples=len(train_indices),
-            replacement=True,
-            generator=sampler_generator
+        membership_csv = write_fold_membership_csv(
+            dataset=dataset,
+            fold_id=fold_id,
+            train_indices=train_indices,
+            val_indices=val_indices,
+            output_dir=PARAMS["output_dir"]
         )
 
-        train_subset = Subset(
-            dataset,
-            train_indices.tolist()
-        )
-
-        val_subset = Subset(
-            dataset,
-            val_indices.tolist()
-        )
-
-        train_loader = DataLoader(
-            train_subset,
-            batch_size=PARAMS["batch_size"],
-            sampler=sampler,
-            num_workers=PARAMS["num_workers"],
-            pin_memory=device.type == "cuda"
-        )
-
-        val_loader = DataLoader(
-            val_subset,
-            batch_size=PARAMS["batch_size"],
-            shuffle=False,
-            num_workers=PARAMS["num_workers"],
-            pin_memory=device.type == "cuda"
-        )
-
-        fold_result = train_fold(
-            fold_idx=fold_idx,
-            train_loader=train_loader,
-            val_loader=val_loader,
+        fold_result = train_one_fold(
+            dataset=dataset,
+            fold_id=fold_id,
+            train_indices=train_indices,
+            val_indices=val_indices,
             device=device,
-            epochs=PARAMS["epochs"]
+            output_dir=PARAMS["output_dir"],
+            num_epochs=PARAMS["epochs"],
+            batch_size=PARAMS["batch_size"],
+            lr=PARAMS["lr"],
+            weight_decay=PARAMS["weight_decay"],
+            positive_sampling_weight=(
+                PARAMS["positive_sampling_weight"]
+            ),
+            use_amp=True,
+            threshold=PARAMS["threshold"]
         )
 
-        fold_results.append(fold_result)
+        fold_result["membership_csv"] = membership_csv
+        summary_rows.append(fold_result)
+
+        # Release fold-specific GPU memory
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+
+        gc.collect()
 
     # --------------------------------------------------------
-    # Final cross-validation results
+    # Cross-validation summary
     # --------------------------------------------------------
-    fold_ious = [
-        result["iou"]
-        for result in fold_results
-    ]
+    summary_dataframe = pd.DataFrame(
+        summary_rows
+    )
 
-    fold_f1_scores = [
-        result["f1"]
-        for result in fold_results
-    ]
+    summary_timestamp = datetime.now().strftime(
+        "%Y%m%d_%H%M%S"
+    )
 
-    print("\n" + "=" * 70)
-    print("FIVE-FOLD CROSS-VALIDATION RESULTS")
-    print("=" * 70)
+    summary_path = os.path.join(
+        PARAMS["output_dir"],
+        f"cv_summary_{summary_timestamp}.csv"
+    )
 
-    for result in fold_results:
+    summary_dataframe.to_csv(
+        summary_path,
+        index=False
+    )
+
+    mean_iou = summary_dataframe[
+        "best_val_iou"
+    ].mean()
+
+    std_iou = summary_dataframe[
+        "best_val_iou"
+    ].std(ddof=1)
+
+    mean_f1 = summary_dataframe[
+        "best_val_f1"
+    ].mean()
+
+    std_f1 = summary_dataframe[
+        "best_val_f1"
+    ].std(ddof=1)
+
+    print("\n" + "=" * 80)
+    print("FIVE-FOLD CROSS-VALIDATION COMPLETE")
+    print("=" * 80)
+
+    for result in summary_rows:
         print(
             f"Fold {result['fold']} | "
             f"Best epoch: {result['best_epoch']} | "
-            f"IoU: {result['iou']:.4f} | "
-            f"F1: {result['f1']:.4f}"
+            f"Val IoU: {result['best_val_iou']:.4f} | "
+            f"Val F1: {result['best_val_f1']:.4f} | "
+            f"Precision: "
+            f"{result['best_val_precision']:.4f} | "
+            f"Recall: "
+            f"{result['best_val_recall']:.4f}"
         )
 
-    print("-" * 70)
-
+    print("-" * 80)
     print(
-        f"Mean IoU: {np.mean(fold_ious):.4f} "
-        f"± {np.std(fold_ious, ddof=1):.4f}"
+        f"Mean validation IoU: "
+        f"{mean_iou:.4f} ± {std_iou:.4f}"
     )
-
     print(
-        f"Mean F1: {np.mean(fold_f1_scores):.4f} "
-        f"± {np.std(fold_f1_scores, ddof=1):.4f}"
+        f"Mean validation F1: "
+        f"{mean_f1:.4f} ± {std_f1:.4f}"
+    )
+    print(
+        f"Summary CSV saved to: {summary_path}"
     )
 
 
