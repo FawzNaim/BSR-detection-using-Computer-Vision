@@ -1640,7 +1640,7 @@ if __name__ == "__main__":
     GT_MASK = (
         r"/content/BSR-detection-using-Computer-Vision/"
         r"masks/Bonaventure_BSR4_label.png"
-    # )
+    )
 
     OUT_DIR = (
         r"/content/BSR-detection-using-Computer-Vision/"
