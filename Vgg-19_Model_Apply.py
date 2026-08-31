@@ -519,7 +519,7 @@ if __name__ == "__main__":
         # epoch=EPOCH,
 
         input_size=512,
-        threshold=0.5,
+        threshold=0.8,
         distance_tolerances=(2, 3, 4, 5),
         overlay_alpha=0.35,
         device_preference=None,       # auto CUDA if available
