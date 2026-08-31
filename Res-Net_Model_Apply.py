@@ -1623,12 +1623,10 @@ if __name__ == "__main__":
         r"/content/BSR-detection-using-Computer-Vision/"
         r"models/best_resnet_bsr.pth"
     )
-
     IMAGE_PATH = (
         r"/content/BSR-detection-using-Computer-Vision/"
-        r"Non_BSR_1_GOM.png"
+        r"Bonaventure_BSR4.png"
     )
-
     # IMPORTANT:
     # This should point to the actual ground-truth MASK,
     # not to IMAGE_PATH.
@@ -1636,14 +1634,12 @@ if __name__ == "__main__":
     # If you do not have a GT mask, set:
     #
     # GT_MASK = None
-
-    GT_MASK = None
-
+    #GT_MASK = None
     # Example:
     #
-    # GT_MASK = (
-    #     r"/content/BSR-detection-using-Computer-Vision/"
-    #     r"masks/Non_BSR_1_GOM.png"
+    GT_MASK = (
+        r"/content/BSR-detection-using-Computer-Vision/"
+        r"masks/Bonaventure_BSR4_label.png"
     # )
 
     OUT_DIR = (
@@ -1719,11 +1715,8 @@ if __name__ == "__main__":
         # ----------------------------------------------------
 
         save_dir=OUT_DIR,
-
         save_basename=None,
-
         save_overlay=True,
-
         save_probs=True,
 
         # ----------------------------------------------------
@@ -1731,7 +1724,6 @@ if __name__ == "__main__":
         # ----------------------------------------------------
 
         show_plots=True,
-
         show_with_cv2=False
     )
 
@@ -1742,26 +1734,21 @@ if __name__ == "__main__":
     print(
         "\nDone."
     )
-
     print(
         "RGB shape:",
         res["rgb"].shape
     )
-
     print(
         "Probability shape:",
         res["prob_u8"].shape
     )
-
     print(
         "Prediction mask shape:",
         res["pred_bin"].shape
     )
-
     print(
         "\nSummary:"
     )
-
     print(
         res["summary"]
     )
