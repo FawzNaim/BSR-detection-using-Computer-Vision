@@ -1592,7 +1592,7 @@ if __name__ == "__main__":
         # Ground-truth mask corresponding to IMAGE_PATH
     GT_MASK = (
         r"/content/BSR-detection-using-Computer-Vision/"
-        r"masks/Bonaventure_BSR4_label.png"
+        r"Bonaventure_BSR4_label.png"
     )
 
     OUT_DIR = (
