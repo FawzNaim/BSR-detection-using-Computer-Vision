@@ -292,7 +292,7 @@ def run_vgg19_unet_inference(
     checkpoints_dir: Optional[str] = None,
     epoch: Optional[int] = None,
     input_size: int = 512,
-    threshold: float = 0.5,
+    threshold: float = 0.8,
     distance_tolerances=(2, 3, 4, 5),
     overlay_alpha: float = 0.35,
     device_preference: Optional[str] = None,
