@@ -160,7 +160,7 @@ def _rewire_for_binary_output(model, model_name: str):
 def build_resnet_segmentation(
     model_name: str = "deeplabv3_resnet50",
     pretrained: bool = False,
-    aux_loss: bool = True
+    aux_loss: bool = False
 ):
     """
     Build a DeepLabV3-ResNet50 or FCN-ResNet50 model.
@@ -212,11 +212,8 @@ def build_resnet_segmentation(
     elif model_name == "fcn_resnet50":
 
         model = fcn_resnet50(
-
             weights=None,
-
             weights_backbone=backbone_weights,
-
             aux_loss=aux_loss
         )
 
@@ -330,12 +327,10 @@ def load_image_rgb_tensor(
         raise FileNotFoundError(
             f"Failed to read image: {image_path}"
         )
-
     rgb = cv2.cvtColor(
         bgr,
         cv2.COLOR_BGR2RGB
     )
-
     h0, w0 = rgb.shape[:2]
 
     # Resize
@@ -356,28 +351,23 @@ def load_image_rgb_tensor(
     # --------------------------------------------------------
 
     if imagenet_normalization:
-
         mean = np.array(
             [0.485, 0.456, 0.406],
             dtype=np.float32
         )
-
         std = np.array(
             [0.229, 0.224, 0.225],
             dtype=np.float32
         )
-
         x = (
             x - mean
         ) / std
-
     # HWC -> CHW
     x = x.transpose(
         2,
         0,
         1
     )
-
     # numpy -> torch
     x = torch.from_numpy(x)
 
@@ -722,7 +712,7 @@ def run_resnet_inference(
 
     model_name: str = "deeplabv3_resnet50",
 
-    aux_loss: bool = True,
+    aux_loss: bool = False,
 
     image_size: int = 512,
 
@@ -1680,7 +1670,7 @@ if __name__ == "__main__":
         model_name="deeplabv3_resnet50",
 
         # MUST match training
-        aux_loss=True,
+        aux_loss=False,
 
         # ----------------------------------------------------
         # Image settings
