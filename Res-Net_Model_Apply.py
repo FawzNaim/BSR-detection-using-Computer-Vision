@@ -39,7 +39,6 @@ from torchvision.models.segmentation import (
     fcn_resnet50
 )
 
-
 # ============================================================
 # MODEL
 # ============================================================
@@ -152,7 +151,6 @@ def _rewire_for_binary_output(model, model_name: str):
 
     return model
 
-
 # ============================================================
 # BUILD MODEL
 # ============================================================
@@ -233,7 +231,6 @@ def build_resnet_segmentation(
 
     return model
 
-
 # ============================================================
 # OUTPUT HELPER
 # ============================================================
@@ -258,7 +255,6 @@ def _ensure_logits(output):
         )
 
     return output
-
 
 # ============================================================
 # DEVICE
@@ -288,7 +284,6 @@ def pick_device(
         if torch.cuda.is_available()
         else "cpu"
     )
-
 
 # ============================================================
 # IMAGE LOADING / PREPROCESSING
@@ -380,19 +375,14 @@ def load_image_rgb_tensor(
         x
     )
 
-
 # ============================================================
 # MASK LOADING
 # ============================================================
 
 def load_mask_binary(
-    mask_path: Optional[str],
+    mask_path: str,
     out_hw: tuple
 ):
-
-    if not mask_path:
-
-        return None
 
     m = cv2.imread(
         mask_path,
@@ -416,7 +406,6 @@ def load_mask_binary(
     return (
         m > 0
     ).astype(np.uint8)
-
 
 # ============================================================
 # OVERLAY
@@ -461,7 +450,6 @@ def overlay_colored(
     )
 
     return out.astype(np.uint8)
-
 
 # ============================================================
 # STRICT METRICS
@@ -524,7 +512,6 @@ def compute_metrics(
         "f1": f1,
         "iou": iou
     }
-
 
 # ============================================================
 # DISTANCE-TOLERANT METRICS
@@ -644,7 +631,6 @@ def compute_tolerance_metrics(
             float(f1_tol)
     }
 
-
 # ============================================================
 # DATA PARALLEL CHECKPOINT HELPER
 # ============================================================
@@ -690,7 +676,6 @@ def _strip_module_prefix(
 
     return state_dict
 
-
 # ============================================================
 # INFERENCE
 # ============================================================
@@ -700,7 +685,7 @@ def run_resnet_inference(
 
     image_path: str,
 
-    mask_path: Optional[str] = None,
+    mask_path: str,
 
     *,
 
@@ -775,13 +760,11 @@ def run_resnet_inference(
             f"bsr_resnet_epoch_{int(epoch):03d}.pth"
         )
 
-    if not os.path.isfile(
-        ckpt_path
-    ):
+    if not os.path.isfile(ckpt_path):
+        raise FileNotFoundError(f"Checkpoint not found: {ckpt_path}")
 
-        raise FileNotFoundError(
-            f"Checkpoint not found: {ckpt_path}"
-        )
+    if not os.path.isfile(mask_path):
+        raise FileNotFoundError(f"Mask not found: {mask_path}")
 
     # --------------------------------------------------------
     # Device
@@ -1007,38 +990,18 @@ def run_resnet_inference(
     # LOAD GROUND TRUTH
     # ========================================================
 
-    gt_bin = (
-
-        load_mask_binary(
-            mask_path,
-            (h0, w0)
-        )
-
-        if mask_path
-
-        else None
-    )
+    gt_bin = load_mask_binary(mask_path, (h0, w0))
 
     # ========================================================
     # OVERLAYS
     # ========================================================
 
-    if gt_bin is not None:
-
-        gt_overlay = overlay_colored(
-
-            rgb,
-
-            gt_bin,
-
-            alpha=overlay_alpha,
-
-            color=(0, 200, 0)
-        )
-
-    else:
-
-        gt_overlay = None
+    gt_overlay = overlay_colored(
+        rgb,
+        gt_bin,
+        alpha=overlay_alpha,
+        color=(0, 200, 0)
+    )
 
     pred_overlay = overlay_colored(
 
@@ -1608,7 +1571,6 @@ def run_resnet_inference(
         }
     }
 
-
 # ============================================================
 # EXAMPLE USAGE
 # ============================================================
@@ -1627,16 +1589,7 @@ if __name__ == "__main__":
         r"/content/BSR-detection-using-Computer-Vision/"
         r"Bonaventure_BSR4.png"
     )
-    # IMPORTANT:
-    # This should point to the actual ground-truth MASK,
-    # not to IMAGE_PATH.
-    #
-    # If you do not have a GT mask, set:
-    #
-    # GT_MASK = None
-    #GT_MASK = None
-    # Example:
-    #
+        # Ground-truth mask corresponding to IMAGE_PATH
     GT_MASK = (
         r"/content/BSR-detection-using-Computer-Vision/"
         r"masks/Bonaventure_BSR4_label.png"
