@@ -1587,12 +1587,12 @@ if __name__ == "__main__":
     )
     IMAGE_PATH = (
         r"/content/BSR-detection-using-Computer-Vision/"
-        r"GOM_MC_BSR55.png"
+        r"GOM_GC_BSR55.png"
     )
         # Ground-truth mask corresponding to IMAGE_PATH
     GT_MASK = (
         r"/content/BSR-detection-using-Computer-Vision/"
-        r"GOM_MC_BSR55_label.png"
+        r"GOM_GC_BSR55_label.png"
     )
 
     OUT_DIR = (
